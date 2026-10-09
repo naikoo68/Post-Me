@@ -1,0 +1,587 @@
+import mongoose from "../db/odm.js";
+
+const socialSchema = new mongoose.Schema(
+  { platform: { type: String, default: "website" }, url: { type: String, default: "" } },
+  { _id: false }
+);
+
+const contactSchema = new mongoose.Schema(
+  { type: { type: String, default: "email" }, value: { type: String, default: "" } },
+  { _id: false }
+);
+
+const aboutValueSchema = new mongoose.Schema(
+  { title: { type: String, default: "" }, desc: { type: String, default: "" } },
+  { _id: false }
+);
+
+const aboutStatSchema = new mongoose.Schema(
+  { value: { type: String, default: "" }, label: { type: String, default: "" }, metric: { type: String, default: "" } },
+  { _id: false }
+);
+
+// Student testimonials shown on the home page (admin-editable).
+const testimonialSchema = new mongoose.Schema(
+  {
+    name: { type: String, default: "" },   // student name
+    exam: { type: String, default: "" },   // exam cleared / role, e.g. "NEET 2025"
+    text: { type: String, default: "" },   // the quote
+    rating: { type: Number, default: 5 },  // 1–5 stars
+    photo: { type: String, default: "" },  // optional image URL / base64
+  },
+  { _id: false }
+);
+
+// Ordered list of home-page sections with visibility (admin drag-to-reorder).
+const homeSectionSchema = new mongoose.Schema(
+  { key: { type: String }, visible: { type: Boolean, default: true } },
+  { _id: false }
+);
+
+// Admin-editable announcement shown in the client welcome popup (the modal that
+// appears every time a client opens their workspace).
+const clientAnnouncementSchema = new mongoose.Schema(
+  {
+    enabled: { type: Boolean, default: false },
+    title: { type: String, default: "" },
+    message: { type: String, default: "" },
+  },
+  { _id: false }
+);
+
+// One admin-editable FAQ entry (question + answer) for the public /faq page.
+const faqItemSchema = new mongoose.Schema(
+  { q: { type: String, default: "" }, a: { type: String, default: "" } },
+  { _id: false }
+);
+
+// FAQ content for the public /faq page, grouped by audience. Empty arrays mean
+// "use the built-in default FAQs" — the front end falls back to its defaults
+// per audience, so leaving an audience blank keeps the shipped questions.
+const faqsSchema = new mongoose.Schema(
+  {
+    student: { type: [faqItemSchema], default: () => [] },
+    creator: { type: [faqItemSchema], default: () => [] },
+    institute: { type: [faqItemSchema], default: () => [] },
+  },
+  { _id: false }
+);
+
+// A client subscription plan (admin-managed). Carries BOTH pricing
+// (label/months/price) AND the AI generation limits granted to a client on the
+// plan (maxPerBatch per generation, perWindow questions per windowMinutes).
+const clientPlanSchema = new mongoose.Schema(
+  {
+    key: { type: String, default: "" }, // stable id (e.g. "1m"); referenced by user.subscriptionPlan
+    label: { type: String, default: "Plan" },
+    cycle: { type: String, default: "" }, // billing group: Monthly | Quarterly | Semi-Annually | Yearly | Trial (blank = inferred from months)
+    months: { type: Number, default: 1 },
+    // Free-trial length in DAYS. Only used when this is the trial plan
+    // (months = 0). 0 = fall back to the built-in default.
+    days: { type: Number, default: 0 },
+    price: { type: Number, default: 0 },
+    trial: { type: Boolean, default: false },
+    maxPerBatch: { type: Number, default: 50 },
+    perWindow: { type: Number, default: 100 },
+    windowMinutes: { type: Number, default: 5 },
+  },
+  { _id: false }
+);
+// A STUDENT subscription plan (admin-managed). Students don't get the AI
+// generator, so a student plan carries ONLY pricing (label/months/price) — no
+// AI limits (unlike clientPlanSchema above).
+const studentPlanSchema = new mongoose.Schema(
+  {
+    key: { type: String, default: "" }, // stable id (e.g. "1m"); referenced by user.studentPlan
+    label: { type: String, default: "Plan" },
+    cycle: { type: String, default: "" }, // Monthly | Quarterly | Semi-Annually | Yearly | Trial (blank = inferred from months)
+    months: { type: Number, default: 1 },
+    // Free-trial length in DAYS. Only used when this is the trial plan
+    // (months = 0). 0 = fall back to the built-in default.
+    days: { type: Number, default: 0 },
+    price: { type: Number, default: 0 },
+    trial: { type: Boolean, default: false },
+  },
+  { _id: false }
+);
+const DEFAULT_HOME_SECTIONS = ["hero", "stats", "quickAccess", "features", "howItWorks", "testimonials", "cta"].map((key) => ({ key, visible: true }));
+
+// Singleton site-wide settings the admin can customise.
+const settingsSchema = new mongoose.Schema(
+  {
+    // NOT globally unique anymore: each tenant has its own "site" settings doc.
+    // Uniqueness is enforced per-tenant by the compound index defined below.
+    key: { type: String, default: "site" },
+    // Cross-posting USER (another person's social accounts) — see
+    // utils/socialProfile.js. The main site doc has socialProfile=false.
+    socialProfile: { type: Boolean, default: false },
+    profileName: { type: String, default: "" },
+    // Cross-posting user: ids of YOUR schedules whose copy was deleted here, so
+    // "Copy everything (+ schedules)" never brings a deleted schedule back.
+    deletedCopiedSchedules: { type: [String], default: [] },
+    // One-time migration flag: existing test series were made private-by-default.
+    testsPrivatized: { type: Boolean, default: false },
+    // One-time migration flag: existing client accounts were granted AI access
+    // (every subscription plan includes AI limits, so any active client may use
+    // the generator unless an admin explicitly turns it off afterwards).
+    aiClientAccessBackfilled: { type: Boolean, default: false },
+    aiClientGeneratorBackfilled: { type: Boolean, default: false },
+    creatorGuideGrandfathered: { type: Boolean, default: false },
+    // One-time flag: existing data was assigned to the default tenant (Phase 2
+    // multi-tenancy backfill). Prevents the startup backfill from repeating.
+    tenantsBackfilled: { type: Boolean, default: false },
+    // One-time flag: existing My-Quiz subjects were placed under a default
+    // "General" exam when the Stream → Exam → Subject level was introduced.
+    practiceExamsBackfilled: { type: Boolean, default: false },
+    allOptionPinned: { type: Boolean, default: false }, // one-time: "All …" options moved to D
+    // First-run setup wizard: an institute admin is walked through branding,
+    // company/contact and policy setup right after signup. Set true once they
+    // finish (or skip the optional final step) so it won't auto-open again.
+    onboardingCompleted: { type: Boolean, default: false },
+    // Set when the institute admin CLOSES the setup wizard ("finish later").
+    // Like onboardingCompleted it stops the wizard auto-opening again, but keeps
+    // the two states distinct: completed = went through the steps; dismissed =
+    // chose to close it. Either one suppresses the auto-open.
+    onboardingDismissed: { type: Boolean, default: false },
+    // Per-institute legal/resource page content. When set, the Privacy / Terms /
+    // Refund pages render this text instead of the generic default copy.
+    privacyPolicy: { type: String, default: "" },
+    termsOfService: { type: String, default: "" },
+    refundPolicy: { type: String, default: "" },
+    siteName: { type: String, default: "Post Me" },
+    tagline: { type: String, default: "Your social media, on autopilot." },
+    // Home-page hero content (the big banner). Blank = fall back to the built-in
+    // default copy on the front end, so an institute can leave them or customise.
+    heroBadge: { type: String, default: "" },   // small pill above the headline
+    heroTitle: { type: String, default: "" },   // the big headline
+    heroSubtitle: { type: String, default: "" }, // the paragraph under the headline
+    logoUrl: { type: String, default: "" }, // image URL or base64 data URI
+    primaryColor: { type: String, default: "#2563eb" },
+    accentColor: { type: String, default: "#f97316" },
+    fontFamily: { type: String, default: "Inter" },
+    // ---- Navbar (header) appearance ----
+    navHeight: { type: Number, default: 64 }, // px
+    navBrandSize: { type: Number, default: 18 }, // site-name font size (px)
+    navFontSize: { type: Number, default: 14 }, // menu link font size (px)
+    navFontWeight: { type: String, default: "500" }, // 400 | 500 | 600 | 700
+    navFontFamily: { type: String, default: "" }, // "" = use site font
+    navTextTransform: { type: String, default: "none" }, // none | uppercase | capitalize
+    defaultZoom: { type: Number, default: 80 }, // default page zoom % for new visitors (50–200)
+    // Screenshot watermark shown over quiz/test question pages.
+    watermarkEnabled: { type: Boolean, default: true },
+    watermarkText: { type: String, default: "" }, // "" = use "<siteName> ©"
+    watermarkOpacity: { type: Number, default: 10 }, // % (2–60)
+    watermarkSize: { type: Number, default: 14 }, // px (8–48)
+    watermarkMode: { type: String, default: "always" }, // "always" | "screenshot" (best-effort)
+    restrictCopy: { type: Boolean, default: true }, // block copy/right-click/selection for students
+    screenshotGuard: { type: Boolean, default: false }, // hide content when window loses focus (anti-screenshot, desktop best-effort)
+    statsAuto: { type: Boolean, default: true }, // true = live counts, false = manual aboutStats values
+    guardHoldMs: { type: Number, default: 1500 }, // how long the screen-guard cover stays after a screenshot key (ms)
+    // Email + notice-board announcement when a new quiz/test is added.
+    notifyOnNewContent: { type: Boolean, default: false },
+    // Auto-expire those content notices this many days after they're posted, so
+    // the board self-cleans instead of piling up. 0 = never expire. Manual
+    // notices are unaffected (they never expire).
+    notifyExpiryDays: { type: Number, default: 30 },
+    // Platform-wide public visibility switches. When OFF, the corresponding
+    // account type is hidden everywhere on the PUBLIC site (sign-up tabs,
+    // pricing audience, sign-in links) and its register route is blocked, so
+    // visitors can't discover or join that feature. Default ON.
+    publicClientEnabled: { type: Boolean, default: true },
+    publicInstituteEnabled: { type: Boolean, default: true },
+    // Per-audience subscription/plan switches. When a flag is OFF the audience's
+    // plans/pricing are hidden from the public site AND that audience gets FREE
+    // access — the paywall is bypassed, so they use the content without needing
+    // a subscription: students skip the subscription gate, creator (client)
+    // accounts don't expire, and the institute plans are hidden. Default ON.
+    studentPlansEnabled: { type: Boolean, default: true },
+    creatorPlansEnabled: { type: Boolean, default: true },
+    institutePlansEnabled: { type: Boolean, default: true },
+    // Admin-panel feature switches. A flat map { navFeatureKey: false } listing
+    // the admin-panel features the owner has turned OFF; a missing (or `true`)
+    // value means the feature is ON. Turning a feature off hides its sidebar
+    // entry and blocks its /admin/* page. Core features (users, aiKeys, storage,
+    // customization) are ALWAYS on and can never be disabled. Edited from the
+    // admin Features page; read by AdminLayout to filter the sidebar.
+    featureFlags: { type: mongoose.Schema.Types.Mixed, default: () => ({}) },
+    // PUBLIC-site feature switches — independent of featureFlags above. A flat
+    // map { navFeatureKey: false } listing features hidden from the PUBLIC site
+    // (navbar, home, footer, the "Start Practicing" chooser); missing/`true` =
+    // shown. This is separate from featureFlags so a feature can be ON in the
+    // admin panel but OFF on the public site (or vice-versa). Edited from the
+    // admin Features page ("Public" switch).
+    publicFeatureFlags: { type: mongoose.Schema.Types.Mixed, default: () => ({}) },
+    // Welcome popup shown to clients each time they open their workspace.
+    clientAnnouncement: {
+      type: clientAnnouncementSchema,
+      default: () => ({ enabled: false, title: "", message: "" }),
+    },
+    // ---- Facebook Page auto-posting (Graph API) ----
+    fbEnabled: { type: Boolean, default: false }, // master on/off for Facebook posting
+    // Site-wide running counter for auto-posts. Every scheduled question/flashcard
+    // post (across ALL schedules, streams, subjects & topics) gets the next number,
+    // so posts read 1, 2, 3, … continuously and the number never restarts per schedule.
+    //
+    // A single shared counter used to leave GAPS on either feed when the other
+    // platform's publish failed (e.g. Facebook posted #242, Instagram failed →
+    // next run Facebook posted #243 while Instagram had never seen #242). We
+    // now keep an INDEPENDENT counter per platform, seeded from `fbPostSerial`
+    // on first use, so each feed always shows a continuous 1, 2, 3, … sequence
+    // regardless of the other platform's failures.
+    fbPostSerial: { type: Number, default: 0 }, // legacy shared counter (kept for migration/back-compat)
+    fbPostSerialFacebook: { type: Number, default: 0 },
+    fbPostSerialInstagram: { type: Number, default: 0 },
+    fbPageId: { type: String, default: "" }, // the Facebook Page's numeric ID
+    fbPageAccessToken: { type: String, default: "" }, // SENSITIVE — long-lived Page access token; never sent to the browser
+    fbAutoOnNotice: { type: Boolean, default: false }, // auto-post to the Page whenever a Notice is added
+    // Telegram (Bot API): the site's bot posts to this channel / group.
+    // Social links (the `socialLinks` list) added automatically: a "Follow us"
+    // block in YouTube descriptions, and a comment on Facebook / Instagram posts.
+    socialLinksOnYoutube: { type: Boolean, default: true },
+    // Your own text added to the description of EVERY video (YouTube long
+    // videos + Shorts, Facebook videos + Reels), e.g. a Telegram invite or a
+    // disclaimer. Can be switched off per platform. See utils/videoDescription.js.
+    videoDescriptionText: { type: String, default: "" },
+    videoDescriptionYoutube: { type: Boolean, default: true },
+    videoDescriptionFacebook: { type: Boolean, default: true },
+    socialLinksComment: { type: Boolean, default: true },
+    tgEnabled: { type: Boolean, default: false },
+    tgBotToken: { type: String, default: "" }, // SENSITIVE — never sent to the browser (tgBotTokenSet)
+    tgChatId: { type: String, default: "" }, // "@channel" or "-100…"
+    fbGraphVersion: { type: String, default: "v21.0" }, // Graph API version
+    // Hashtags: a global set appended to EVERY question post, plus auto tags
+    // generated from each question's subject/topic/section.
+    fbDefaultHashtags: { type: String, default: "" },
+    fbAutoHashtags: { type: Boolean, default: true },
+    // Extra Facebook Pages to cross-post to (each needs its OWN page token).
+    // Facebook GROUPS cannot be posted to via the API (deprecated), so only
+    // Pages you manage can be added here.
+    fbExtraTargets: {
+      type: [new mongoose.Schema({ label: { type: String, default: "" }, pageId: { type: String, default: "" }, token: { type: String, default: "" } }, { _id: false })],
+      default: () => [],
+    },
+    // Selfie watermark overlaid on every Facebook/Instagram image post.
+    // Stored as a Cloudinary URL after the admin uploads their photo.
+    fbSelfieWatermarkUrl: { type: String, default: "" },
+    fbSelfieWatermarkEnabled: { type: Boolean, default: true },
+    fbSelfieWatermarkPosition: { type: String, default: "bottom-right" }, // bottom-right | bottom-left | top-right | top-left
+    fbSelfieWatermarkSize: { type: Number, default: 120 }, // px (diameter/width of the watermark)
+    fbSelfieWatermarkOpacity: { type: Number, default: 90 }, // % (10–100)
+    fbSelfieWatermarkShape: { type: String, default: "circle" }, // circle | rectangle
+    // Custom flashcard TEMPLATE image (for the "Flashcard" auto-post type). When
+    // set & enabled, the flashcard render overlays the quiz question's content
+    // onto this uploaded image instead of the built-in design. Cloudinary URL.
+    fbFlashcardTemplateUrl: { type: String, default: "" },
+    // Video branding (header logo + name, footer website) on AI Slideshow /
+    // Reel / Short / long-video slides. Per account — never copied to a
+    // cross-posting user (see utils/videoBrand.js). Blank = automatic.
+    videoBrandName: { type: String, default: "" },
+    // Where the white question / answer card sits on an uploaded slide
+    // template: { top, bottom, side } fractions (utils/cardBox.js). null = default.
+    slideshowCardBox: { type: mongoose.Schema.Types.Mixed, default: null },   // 9:16 Reel / Short
+    longVideoCardBox: { type: mongoose.Schema.Types.Mixed, default: null },   // 16:9 long video
+    videoBrandLogoUrl: { type: String, default: "" }, // hosted https image
+    videoBrandWebsite: { type: String, default: "" },
+    videoBrandColor: { type: String, default: "" },
+    fbFlashcardTemplateEnabled: { type: Boolean, default: true },
+    // Auto first-comment (see the full auto-comment block lower down). Master
+    // on/off toggle + the LEGACY single comment. `fbAutoComment` is kept for
+    // back-compat and used as a fallback when the `fbAutoComments` list is empty.
+    // @everyone/@followers appear as plain text — the platform APIs don't expose
+    // a notify-all action for Pages/IG.
+    fbAutoCommentEnabled: { type: Boolean, default: false },
+    fbAutoComment: { type: String, default: "" },
+    // SHARED Reel music library (public track URLs). Added ONCE here and reused
+    // by every question/flashcard schedule set to post as a Reel — each such
+    // schedule ROTATES through these tracks (one per Reel, then starts over), so
+    // the admin never re-uploads music per schedule.
+    fbReelAudios: { type: [String], default: [] },
+    // ---- AI Slideshow narration (Text-to-Speech) ----
+    // Provider for the "AI Slideshow + Voice" post type. "edge" = FREE Microsoft
+    // Edge TTS (no key needed, default); "openai" = OpenAI TTS (needs a key).
+    ttsProvider: { type: String, default: "" }, // "" resolves to "edge" (free)
+    // SENSITIVE — API key for a paid provider (OpenAI). Never sent to the
+    // browser (masked as ttsApiKeySet, exactly like fbPageAccessToken). Only the
+    // "edge" provider works without this. Falls back to the OPENAI_TTS_API_KEY
+    // env var when blank.
+    ttsApiKey: { type: String, default: "" },
+    // Optional model override for the paid provider (default gpt-4o-mini-tts).
+    ttsModel: { type: String, default: "" },
+    // Other paid narration engines (see utils/ttsVoices.js). The *Key fields are
+    // SENSITIVE — never sent to the browser (masked as <field>Set).
+    ttsElevenLabsKey: { type: String, default: "" },
+    ttsElevenLabsModel: { type: String, default: "" }, // default eleven_multilingual_v2
+    ttsGoogleCloudKey: { type: String, default: "" },
+    ttsAzureKey: { type: String, default: "" },
+    ttsAzureRegion: { type: String, default: "" },     // e.g. "centralindia"
+    // Any OpenAI-compatible speech API: base URL (…/v1), key (optional), model.
+    ttsCustomUrl: { type: String, default: "" },
+    ttsCustomKey: { type: String, default: "" },
+    ttsCustomModel: { type: String, default: "" },
+    // Site-wide AI Slideshow settings (Admin → Facebook → "AI Slideshow"),
+    // applied to every AI Slideshow schedule. Seconds each of the two slides
+    // stays on screen (it stays longer if the narration needs it).
+    slideshowQuestionSec: { type: Number, default: 10 }, // slide 1: question + options
+    slideshowAnswerSec: { type: Number, default: 8 },    // slide 2: answer reveal
+    slideshowVoice: { type: String, default: "" },       // "" = the engine's default voice
+    slideshowAutoCaptions: { type: Boolean, default: true },
+    // What the narrator reads aloud (each part is read IN FULL; the slide stays
+    // up until the narration ends). Slide 1: question text, options. Slide 2:
+    // explanation, key points, quick recall. The correct answer is always read.
+    // Which slides each question gets: "both" = question + answer/explanation
+    // slide (default); "question" = question slide only (answer not revealed).
+    slideshowSlides: { type: String, enum: ["both", "question"], default: "both" },
+    // Question-only mode: after the question is read, pause this long, then
+    // show the correct option in green for slideshowRevealSec (optionally saying it).
+    slideshowRevealPauseSec: { type: Number, default: 3 },
+    slideshowRevealSec: { type: Number, default: 3 },
+    slideshowRevealSay: { type: Boolean, default: true },
+    slideshowReadQuestion: { type: Boolean, default: true },
+    slideshowReadOptions: { type: Boolean, default: true },
+    slideshowReadExplanation: { type: Boolean, default: true },
+    slideshowReadKeyPoints: { type: Boolean, default: true },
+    slideshowReadQuickRecall: { type: Boolean, default: true },
+    // Optional background TEMPLATE images (uploaded, public URLs) for the two
+    // slide types. When set, the slide is drawn on top of the template (the
+    // question/answer in a white card in the middle) instead of the built-in
+    // design. Recommended size 1080×1920.
+    slideshowQuestionTemplateUrl: { type: String, default: "" },
+    // Slide backgrounds for LONG (16:9, 1920×1080) YouTube/Facebook videos —
+    // separate from the 9:16 Reel templates above. Blank = built-in design.
+    longVideoQuestionTemplateUrl: { type: String, default: "" },
+    longVideoAnswerTemplateUrl: { type: String, default: "" },
+    // Intro (opening title) and outro (closing) slide backgrounds, 16:9.
+    longVideoIntroTemplateUrl: { type: String, default: "" },
+    longVideoOutroTemplateUrl: { type: String, default: "" }, // full video's "thanks for watching" slide
+    longVideoShortOutroTemplateUrl: { type: String, default: "" }, // Short's "watch the full quiz" slide (9:16)
+    longVideoShortIntroTemplateUrl: { type: String, default: "" }, // Short's opening title slide (9:16)
+    // Text box + styling for the intro / end / Short-end slides (same shape as
+    // the thumbnail's) — position, colours, sizes, font, outline, shade, rotate.
+    longVideoIntroText: { type: mongoose.Schema.Types.Mixed, default: null },
+    longVideoOutroText: { type: mongoose.Schema.Types.Mixed, default: null },
+    longVideoShortOutroText: { type: mongoose.Schema.Types.Mixed, default: null },
+    longVideoShortIntroText: { type: mongoose.Schema.Types.Mixed, default: null },
+    // The long-video form's saved settings ("Save settings only"): questions,
+    // engine, voice, slides, times, read-aloud, captions, destinations. Cleaned
+    // by normalizeLongVideoOptions (config/longVideo.js).
+    longVideoDefaults: { type: mongoose.Schema.Types.Mixed, default: null },
+    // Marathon videos' OWN designs (slide templates, card box, intro / end
+    // slides, thumbnail, saved form settings) — same keys as the shared
+    // long-video fields; null = not separated yet. See utils/marathonDesign.js.
+    marathonDesign: { type: mongoose.Schema.Types.Mixed, default: null },
+    slideshowAnswerTemplateUrl: { type: String, default: "" },
+    // Center TEXT watermark drawn diagonally across the middle of every
+    // Facebook/Instagram question-card image (in addition to the selfie/logo
+    // above). Text is optional — when blank it falls back to the site watermark
+    // text, else the site name.
+    fbTextWatermarkEnabled: { type: Boolean, default: false },
+    fbTextWatermarkText: { type: String, default: "" }, // "" = use site watermark text / site name
+    fbTextWatermarkSize: { type: Number, default: 64 }, // px (12–300)
+    fbTextWatermarkOpacity: { type: Number, default: 12 }, // % (2–100)
+    // Email notifications about the auto-poster. Sent to `fbNotifyEmail` (else
+    // NOTIFY_EMAIL env, else the first admin account).
+    fbNotifyEmail: { type: String, default: "" }, // where to send FB notifications ("" = admin default)
+    fbNotifyOnPost: { type: Boolean, default: false }, // email on EVERY successful auto-post (off by default — can be noisy)
+    fbNotifyOnError: { type: Boolean, default: true }, // email when an auto-post fails
+    fbNotifyOnComplete: { type: Boolean, default: true }, // email when a schedule finishes its whole source
+    // Instagram cross-posting (uses the same Page token; IG account linked to the Page)
+    igEnabled: { type: Boolean, default: false },
+    igUserId: { type: String, default: "" }, // Instagram Business account id (blank = auto-detect from the Page)
+    // ---- YouTube auto-posting (Shorts) ----
+    // Connected via Google OAuth ("Connect YouTube" in Admin → Facebook). The
+    // refresh token and client secret are SENSITIVE — stored encrypted
+    // (utils/keyCrypto.js) and never sent to the browser (see safeSettings).
+    // Client ID/secret may also come from env (YOUTUBE_CLIENT_ID / _SECRET).
+    ytEnabled: { type: Boolean, default: false },
+    ytClientId: { type: String, default: "" },
+    ytClientSecret: { type: String, default: "" }, // SENSITIVE (encrypted)
+    ytRefreshToken: { type: String, default: "" }, // SENSITIVE (encrypted)
+    ytChannelId: { type: String, default: "" },
+    ytChannelTitle: { type: String, default: "" },
+    ytConnectedAt: { type: Date, default: null },
+    ytPrivacy: { type: String, enum: ["public", "unlisted", "private"], default: "public" },
+    // Scopes Google granted (space separated) — playlists need youtube.force-ssl.
+    ytScopes: { type: String, default: "" },
+    // Default playlists ("folders"): every Short / long video is added to these
+    // (blank = no playlist). The title is kept only for display.
+    ytShortsPlaylistId: { type: String, default: "" },
+    ytShortsPlaylistTitle: { type: String, default: "" },
+    ytLongPlaylistId: { type: String, default: "" },
+    ytLongPlaylistTitle: { type: String, default: "" },
+    // Thumbnail template for LONG videos (1280×720): the subject / topic /
+    // "25 Questions" are written on it and it's set as the video's thumbnail.
+    ytThumbTemplateUrl: { type: String, default: "" },
+    ytThumbEnabled: { type: Boolean, default: true },
+    ytThumbShowText: { type: Boolean, default: true },
+    // Marathon thumbnail: show the stream / the subject on the small top line.
+    ytThumbShowStream: { type: Boolean, default: true },
+    ytThumbShowSubject: { type: Boolean, default: true },
+    ytThumbTextPosition: { type: String, enum: ["left", "center", "right", "bottom"], default: "left" },
+    ytThumbTextColor: { type: String, default: "#ffffff" },
+    ytThumbAccentColor: { type: String, default: "#facc15" }, // quiz badge fill
+    // The empty area the text fills (fractions of the 1280×720 frame) + full styling.
+    ytThumbBox: { type: mongoose.Schema.Types.Mixed, default: null }, // { x, y, w, h }
+    ytThumbAlign: { type: String, enum: ["left", "center", "right"], default: "left" },
+    ytThumbVAlign: { type: String, enum: ["top", "center", "bottom"], default: "center" },
+    ytThumbFont: { type: String, enum: ["sans", "serif", "mono", "anton", "bebas", "poppins", "oswald", "montserrat"], default: "sans" },
+    ytThumbUppercase: { type: Boolean, default: false },
+    ytThumbKickerColor: { type: String, default: "" }, // blank = same as text colour
+    ytThumbBadgeTextColor: { type: String, default: "#111111" },
+    ytThumbStrokeColor: { type: String, default: "#000000" },
+    ytThumbStrokeWidth: { type: Number, default: 3 }, // outline px (0 = none)
+    ytThumbShadow: { type: Boolean, default: true },
+    ytThumbPanelColor: { type: String, default: "" }, // shade box behind the text (blank = none)
+    ytThumbPanelOpacity: { type: Number, default: 0 }, // 0–100
+    ytThumbPanelRadius: { type: Number, default: 24 },
+    // Text sizes (px on the 1280×720 frame) and line spacing.
+    ytThumbHeadlineSize: { type: Number, default: 104 }, // topic — auto-shrinks only if it overflows
+    ytThumbKickerSize: { type: Number, default: 44 }, // subject line
+    ytThumbBadgeSize: { type: Number, default: 46 }, // quiz badge
+    ytThumbLineHeight: { type: Number, default: 1.05 }, // line spacing (0.8–2)
+    ytThumbRotate: { type: Number, default: 0 }, // text box rotation, degrees (-180–180)
+    // ---- Auto-comments ("first comment") ----
+    // A GLOBAL list of comments the admin writes once; after EVERY scheduled
+    // auto-post/reel publishes, the app adds a saved comment as the first
+    // comment under it (the classic "put your link/CTA in the first comment"
+    // technique). Enabled by `fbAutoCommentEnabled` above; when this list is
+    // empty the legacy single `fbAutoComment` is used. Stories are excluded —
+    // the API can't comment on a Story.
+    fbAutoComments: { type: [String], default: [] }, // the saved comment lines
+    // How a comment is chosen per post: rotate one-per-post (default), post ALL
+    // of them, or a random one.
+    fbAutoCommentMode: { type: String, enum: ["rotate", "all", "random"], default: "rotate" },
+    fbAutoCommentIndex: { type: Number, default: 0 }, // rotation pointer (advances each post)
+    fbAutoCommentToFacebook: { type: Boolean, default: true },  // comment on Facebook posts
+    fbAutoCommentToInstagram: { type: Boolean, default: false }, // needs instagram_manage_comments
+    // Optional @-mention list appended to every auto-comment (e.g. ["@myfriend",
+    // "@mystudyguide_"]). Instagram parses `@handle` in the message body and
+    // renders it as a clickable mention when the account exists; Facebook makes
+    // ONLY Page tags clickable, using the `@[page-id]` bracketed form. Plain
+    // `@name` on Facebook stays plain text — the API can't tag personal profiles.
+    fbAutoCommentMentions: { type: [String], default: [] },
+    // Instagram NEVER makes links in captions/comments tappable (YouTube Shorts
+    // comments neither). Optional Instagram-only comment list — used instead of
+    // `fbAutoComments` on Instagram when non-empty (same mode/rotation). When
+    // empty, the main list is reused with its URLs rewritten to a bare domain.
+    igAutoComments: { type: [String], default: [] },
+    // Call to action added wherever a URL was rewritten for Instagram / a Short
+    // ("" = add nothing).
+    linkInBioText: { type: String, default: "🔗 Link in bio" },
+    // ---- Google Drive backup ----
+    // OAuth Web Client ID (from Google Cloud Console). NOT a secret — it is meant
+    // to be public in the browser. When set, the "Back up / Restore to Google
+    // Drive" buttons turn on for admins and clients. Blank = feature hidden.
+    // White-label buyers paste their own Client ID here.
+    googleClientId: { type: String, default: "" },
+    socialLinks: {
+      type: [socialSchema],
+      default: () => [
+        { platform: "facebook", url: "" },
+        { platform: "instagram", url: "" },
+        { platform: "whatsapp", url: "" },
+        { platform: "youtube", url: "" },
+      ],
+    },
+    contacts: {
+      type: [contactSchema],
+      default: () => [
+        { type: "email", value: "hello@mystudyguide.com" },
+        { type: "phone", value: "+91 98765 43210" },
+        { type: "address", value: "Knowledge Park, New Delhi, India" },
+      ],
+    },
+    // Editable "About Us" page content
+    aboutHeading: { type: String, default: "Built by educators, loved by toppers" },
+    aboutIntro: {
+      type: String,
+      default:
+        "My Study Guide started with one belief — that smart, structured practice beats endless cramming. We combine curated question banks with real-time analytics to help you study exactly what matters.",
+    },
+    aboutValues: {
+      type: [aboutValueSchema],
+      default: () => [
+        { title: "Our Mission", desc: "Make high-quality exam preparation accessible and affordable for every student." },
+        { title: "Our Vision", desc: "Become the most trusted self-study companion powered by data-driven learning." },
+        { title: "Our Promise", desc: "Honest content, transparent analytics and relentless focus on student outcomes." },
+      ],
+    },
+    homeSections: {
+      type: [homeSectionSchema],
+      default: () => DEFAULT_HOME_SECTIONS,
+    },
+    // ---- AI generation limits ----
+    // The admin's own per-batch cap AND the hard ceiling no plan can exceed.
+    aiMaxPerBatch: { type: Number, default: 500 },
+    // Client subscription plans (pricing + AI limits). A client's AI limits come
+    // from the plan they purchased (user.subscriptionPlan). Registration,
+    // checkout and upgrade all read these. Defaults mirror the original prices.
+    clientPlans: {
+      type: [clientPlanSchema],
+      default: () => [
+        { key: "trial", label: "1-Day Free Trial", cycle: "Trial", months: 0, price: 0, trial: true, maxPerBatch: 50, perWindow: 50, windowMinutes: 5 },
+        { key: "1m", label: "1 Month", cycle: "Monthly", months: 1, price: 299, maxPerBatch: 50, perWindow: 100, windowMinutes: 5 },
+        { key: "2m", label: "2 Months", cycle: "Monthly", months: 2, price: 499, maxPerBatch: 100, perWindow: 200, windowMinutes: 5 },
+        { key: "6m", label: "6 Months", cycle: "Semi-Annually", months: 6, price: 699, maxPerBatch: 200, perWindow: 400, windowMinutes: 5 },
+        { key: "1y", label: "1 Year", cycle: "Yearly", months: 12, price: 899, maxPerBatch: 500, perWindow: 1000, windowMinutes: 5 },
+      ],
+    },
+    // Student subscription plans (pricing only — students have no AI generator).
+    // A student unlocks quiz/test attempts + their performance Dashboard while
+    // their plan is active. Registration is free; students subscribe from the
+    // paywall / pricing page.
+    studentPlans: {
+      type: [studentPlanSchema],
+      default: () => [
+        { key: "trial", label: "1-Day Free Trial", cycle: "Trial", months: 0, price: 0, trial: true },
+        { key: "1m", label: "1 Month", cycle: "Monthly", months: 1, price: 149 },
+        { key: "3m", label: "3 Months", cycle: "Quarterly", months: 3, price: 399 },
+        { key: "6m", label: "6 Months", cycle: "Semi-Annually", months: 6, price: 699 },
+        { key: "1y", label: "1 Year", cycle: "Yearly", months: 12, price: 899 },
+      ],
+    },
+    // Institute (tenant) subscription plans — what an institute pays to run its
+    // own space on the platform (used by the public institute self-signup).
+    // Pricing only. Lives on the DEFAULT tenant's settings (the platform level).
+    tenantPlans: {
+      type: [studentPlanSchema],
+      default: () => [
+        { key: "trial", label: "14-Day Free Trial", cycle: "Trial", months: 0, price: 0, trial: true },
+        { key: "1m", label: "1 Month", cycle: "Monthly", months: 1, price: 1499 },
+        { key: "6m", label: "6 Months", cycle: "Semi-Annually", months: 6, price: 6999 },
+        { key: "1y", label: "1 Year", cycle: "Yearly", months: 12, price: 11999 },
+      ],
+    },
+    aboutStats: {
+      type: [aboutStatSchema],
+      default: () => [
+        { value: "1,20,000+", label: "Total Students" },
+        { value: "8,500+", label: "Total Quizzes" },
+        { value: "640+", label: "Total Public Test Series" },
+      ],
+    },
+    // Admin-editable FAQ content for the public /faq page, per audience
+    // (Students / Creators / Institutes). Any audience left empty falls back to
+    // the front end's built-in default questions for that audience.
+    faqs: {
+      type: faqsSchema,
+      default: () => ({ student: [], creator: [], institute: [] }),
+    },
+    // Student testimonials for the home page.
+    testimonials: {
+      type: [testimonialSchema],
+      default: () => [
+        { name: "Aisha Khan", exam: "Cleared SSC CGL 2025", rating: 5, text: "The subject-wise quizzes and instant solutions made my revision so much faster. The analytics showed exactly where I was weak.", photo: "" },
+        { name: "Rahul Verma", exam: "NEET Aspirant", rating: 5, text: "Full-length mock tests feel just like the real exam. Timers, palette, auto-submit — everything is spot on.", photo: "" },
+        { name: "Sneha Patil", exam: "State PSC 2025", rating: 5, text: "I love that I can practise for free and track my rank. It kept me motivated every single day.", photo: "" },
+      ],
+    },
+  },
+  { timestamps: true }
+);
+
+// Per-tenant uniqueness: one settings doc per (tenant, key). Replaces the old
+// global-unique index on `key` (dropped at startup — see ensureSettingsIndexes
+// in server.js) so each institute can have its own "site" settings document.
+settingsSchema.index({ tenantId: 1, key: 1 }, { unique: true });
+
+export default mongoose.model("Settings", settingsSchema);

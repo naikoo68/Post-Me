@@ -1,0 +1,930 @@
+import { socialSettingsFilter, scheduleProfileFilter, activeSocialProfileId, ensureProfileIdBackfill } from "../utils/socialProfile.js";
+import FbSchedule from "../models/FbSchedule.js";
+import Question from "../models/Question.js";
+import Settings from "../models/Settings.js";
+import { myVoiceOptions, voiceOwnerFor } from "../config/myVoice.js";
+import { getOrCreateOwn } from "./settingsController.js";
+import { randomUUID } from "node:crypto";
+import { runScheduleOnce, getFacebookConfig, getFacebookSiteForConfig, hashtagsForQuestion, getFacebookPublishedCount, countFacebookPosts, pickQuestionForSchedule, pickQuestionsForSlideshow, pickAllQuestionsForSource } from "../config/facebook.js";
+import FbPost from "../models/FbPost.js";
+import { rememberDeletedCopies } from "./socialProfileController.js";
+import { slideshowBrandOpts } from "../utils/videoBrand.js";
+import { getCurrentTenantId } from "../utils/tenantContext.js";
+import { renderQuestionImage } from "../config/socialImage.js";
+import { renderQuestionCardShot, renderFlashcardCardShot } from "../config/cardShot.js";
+import TestSeries from "../models/TestSeries.js";
+import PracticeStream from "../models/PracticeStream.js";
+import PracticeSubject from "../models/PracticeSubject.js";
+import PracticeTopic from "../models/PracticeTopic.js";
+import { isSafePublicUrl } from "../utils/urlGuard.js";
+import { isYoutubeConfigured, cleanYtPlaylistId } from "../config/youtube.js";
+import { pickLongVideoScheduleFields, activeJobsForSchedules, cancelJobsForSchedules, planByQuizNext, isTopicLevelSource, longVideoTargets } from "../config/longVideo.js";
+import { isQuestionComplete } from "../utils/questionComplete.js";
+import { composeImageAudioToVideo, isCloudinaryConfigured } from "../config/cloudinary.js";
+import { generateSlideshow, isSlideshowConfigured } from "../config/slideshow.js";
+import { TTS_PROVIDERS, PROVIDER_VOICES, DEFAULT_TTS_PROVIDER, TTS_KEY_FIELDS } from "../utils/ttsVoices.js";
+
+// POST /api/facebook/compose-reel  (admin) — build a vertical MP4 (a Reel) from
+// a still image + an audio track, both given as PUBLIC http(s) URLs (uploaded
+// via the media uploader). Returns { url } — the composed video — which the UI
+// then stores as the schedule's customVideo so it posts as a real Reel to
+// Facebook/Instagram through the normal Reel pipeline. Both inputs are
+// SSRF-validated so the server can't be pointed at internal addresses.
+export async function composeReel(req, res) {
+  const imageUrl = String(req.body?.imageUrl || "").trim();
+  const audioUrl = String(req.body?.audioUrl || "").trim();
+  if (!imageUrl || !audioUrl) {
+    return res.status(400).json({ message: "An image and an audio file are both required to build a Reel." });
+  }
+  if (!/^https?:\/\//i.test(imageUrl) || !isSafePublicUrl(imageUrl)) {
+    return res.status(400).json({ message: "The image URL is not a valid public link." });
+  }
+  if (!/^https?:\/\//i.test(audioUrl) || !isSafePublicUrl(audioUrl)) {
+    return res.status(400).json({ message: "The audio URL is not a valid public link." });
+  }
+  if (!isCloudinaryConfigured()) {
+    return res.status(503).json({ message: "Media processing isn't set up yet (Cloudinary keys missing)." });
+  }
+  // Optional Reel length in seconds (default 30, clamped 1–90 by the composer).
+  const durationSec = Number(req.body?.durationSec ?? req.body?.reelDuration) || 30;
+  try {
+    const { url, duration } = await composeImageAudioToVideo({ imageUrl, audioUrl, durationSec });
+    return res.json({ url, duration });
+  } catch (err) {
+    return res.status(502).json({ message: err?.message || "Could not build the Reel video." });
+  }
+}
+
+// POST /api/facebook/slideshow/test  (admin) — build an AI Educational Slideshow
+// (branded slides + AI text-to-speech narration → 9:16 MP4) for ONE question and
+// return the video URL + metadata, WITHOUT publishing. Used by the admin
+// "Generate Test Slideshow" button to preview before enabling scheduled posts.
+//
+// Body (any one of):
+//   { questionId }               — build for a specific question, OR
+//   { scheduleId }               — build for the question the schedule would pick, OR
+//   {}                           — no source ⇒ 400.
+// Plus optional overrides: { ttsVoice, autoCaptions, generateImages }.
+export async function testSlideshow(req, res) {
+  if (!isSlideshowConfigured()) {
+    return res.status(503).json({ success: false, message: "Media processing isn't set up yet (Cloudinary keys missing)." });
+  }
+
+  // Resolve the question: an explicit id, or the one the schedule would pick.
+  let q = null;
+  let pickFrom = null; // schedule-like object to draw MORE questions from
+  const extraRandom = []; // extra random questions (no source picked)
+  const wantCount = clampQuestionCount(req.body?.slideshowQuestions);
+  const questionId = String(req.body?.questionId || "").trim();
+  const scheduleId = String(req.body?.scheduleId || "").trim();
+  try {
+    if (questionId) {
+      q = await Question.findById(questionId).lean();
+      if (!q) return res.status(404).json({ success: false, message: "Question not found." });
+    } else if (scheduleId) {
+      const sch = await FbSchedule.findById(scheduleId).lean();
+      if (!sch) return res.status(404).json({ success: false, message: "Schedule not found." });
+      // Non-destructive: pickQuestionForSchedule reads but never saves the sched.
+      const picked = await pickQuestionForSchedule(sch);
+      if (picked?.exhausted || !picked?.q) {
+        return res.status(404).json({ success: false, message: "No complete question available in this schedule's source." });
+      }
+      q = picked.q;
+      pickFrom = sch;
+    } else if (req.body?.source && typeof req.body.source === "object") {
+      // An UNSAVED form: pick a question from the chosen source, exactly as the
+      // schedule would at run time (transient — nothing is written).
+      const src = req.body.source;
+      const transient = {
+        source: {
+          subject: src.subject || null,
+          session: src.session || null,
+          quiz: src.quiz || null,
+          testSeries: src.testSeries || null,
+          question: src.question || null,
+        },
+        order: req.body.order === "sequential" ? "sequential" : "random",
+        postedQuestionIds: [],
+      };
+      if (!transient.source.subject && !transient.source.session && !transient.source.quiz && !transient.source.testSeries && !transient.source.question) {
+        return res.status(400).json({ success: false, message: "Pick a source (subject, session, quiz or test) first." });
+      }
+      const picked = await pickQuestionForSchedule(transient);
+      if (picked?.exhausted || !picked?.q) {
+        return res.status(404).json({ success: false, message: "No complete published question found in the selected source." });
+      }
+      q = picked.q;
+      pickFrom = transient;
+    } else {
+      // No source (the settings-section test button): preview with a random
+      // complete, published question from this site's bank.
+      const filter = { status: "published", deleted: { $ne: true } };
+      const count = await Question.countDocuments(filter);
+      const seen = new Set();
+      for (let tries = 0; tries < 25 * wantCount && count > 0 && extraRandom.length < wantCount; tries++) {
+        const cand = await Question.findOne(filter).skip(Math.floor(Math.random() * count)).lean();
+        if (cand && !seen.has(String(cand._id)) && isQuestionComplete(cand).ok) { seen.add(String(cand._id)); extraRandom.push(cand); }
+      }
+      q = extraRandom[0] || null;
+      if (!q) return res.status(404).json({ success: false, message: "No complete published question found to preview." });
+    }
+  } catch (e) {
+    return res.status(400).json({ success: false, message: e?.message || "Could not load the question." });
+  }
+
+  // The SAME settings doc the scheduler uses (raw — carries the unmasked
+  // ttsApiKey) so the test resolves the same TTS provider as a real run.
+  const cfg = await getFacebookConfig().catch(() => ({}));
+  const savedSite = (await getFacebookSiteForConfig(cfg).catch(() => null))
+    || (await Settings.findOne(socialSettingsFilter()).lean().catch(() => null));
+  // The narration engine currently on screen (+ a newly typed key) applies to
+  // THIS test only — nothing is saved. Blank keys keep the saved ones. (A custom
+  // API URL is checked against the SSRF guard when it's actually called.)
+  const site = withEngineOverride(savedSite, req.body?.engine);
+  const autoCaptions = req.body?.autoCaptions !== false;
+  const generateImages = !!req.body?.generateImages;
+
+  // Rendering takes a minute or more — longer than the Nginx/browser request
+  // timeouts — so run it as a BACKGROUND job and let the UI poll for the result
+  // (GET /facebook/slideshow/test/:jobId). The job keeps the request's tenant
+  // context (AsyncLocalStorage follows the promise).
+  // The questions for this preview video (up to the requested count).
+  let questions = [q];
+  // LONG-video preview (16:9): the first questions the real video would use
+  // (same Start from / order), capped so the preview stays quick.
+  const landscape = req.body?.landscape === true;
+  if (landscape && req.body?.source && typeof req.body.source === "object") {
+    const lv = await pickAllQuestionsForSource(req.body.source, {
+      max: Math.min(3, wantCount),
+      start: Number(req.body?.start) || 1,
+      order: req.body?.order === "random" ? "random" : "sequential",
+    }).catch(() => []);
+    if (lv.length) questions = lv;
+  } else if (wantCount > 1) {
+    if (pickFrom) questions = await pickQuestionsForSlideshow(pickFrom, wantCount, q).catch(() => [q]);
+    else if (extraRandom.length) questions = extraRandom;
+  }
+  const useLongTemplates = landscape && req.body?.useTemplates !== false;
+
+  const jobId = newSlideshowJob(req.user?._id);
+  const job = slideshowJobs.get(jobId);
+  generateSlideshow(questions, {
+    voice: req.body?.ttsVoice, // normalised to the effective provider inside
+    autoCaptions,
+    generateImages,
+    // Question-only vs question + answer slides — the form's choice (else saved).
+    slidesMode: typeof req.body?.slidesMode === "string" ? req.body.slidesMode : undefined,
+    // Question-only answer reveal (pause / show time / say it) — the form's values.
+    reveal: req.body?.reveal && typeof req.body.reveal === "object" ? req.body.reveal : undefined,
+    // What to read aloud — the form's current toggles (else the saved settings).
+    read: req.body?.read && typeof req.body.read === "object" ? req.body.read : undefined,
+    // The form's current slide times (so a test reflects unsaved edits).
+    questionSec: clampSlideSec(req.body?.questionSec, 10),
+    answerSec: clampSlideSec(req.body?.answerSec, 8),
+    // The saved question / answer slide templates (uploads save immediately):
+    // the 16:9 long-video ones for a landscape preview, else the 9:16 Reel ones.
+    questionTemplateUrl: landscape ? (useLongTemplates ? site?.longVideoQuestionTemplateUrl || "" : "") : site?.slideshowQuestionTemplateUrl || "",
+    answerTemplateUrl: landscape ? (useLongTemplates ? site?.longVideoAnswerTemplateUrl || "" : "") : site?.slideshowAnswerTemplateUrl || "",
+    ...(landscape ? { orientation: "landscape" } : {}),
+    site,
+    ...slideshowBrandOpts(site, { siteUrl: cfg?.siteUrl || "https://www.mystudyguide.in" }),
+    onStatus: (st) => { job.stage = st; job.progress = null; job.updatedAt = Date.now(); },
+    // Per-slide progress within the current step, so the UI can show % + time left.
+    onProgress: (st, done, total) => { job.stage = st; job.progress = { done, total }; job.updatedAt = Date.now(); },
+  })
+    .then((result) => {
+      Object.assign(job, {
+        status: "done",
+        stage: "READY",
+        updatedAt: Date.now(),
+        result: {
+          success: true,
+          videoUrl: result.videoUrl,
+          slides: result.slides,
+          questions: result.questions,
+          duration: result.duration,
+          voice: result.voice,
+          provider: result.provider,
+          fallbackSlides: result.fallbackSlides || [],
+          ttsNote: result.ttsNote || "",
+        },
+      });
+    })
+    .catch((err) => {
+      Object.assign(job, { status: "failed", stage: "FAILED", updatedAt: Date.now(), error: err?.message || "Could not build the slideshow." });
+      console.error("[slideshow test] failed:", err?.message || err);
+    });
+
+  return res.status(202).json({ success: true, jobId, status: "running", stage: job.stage });
+}
+
+// Copy of the settings doc with the test form's engine fields applied.
+const ENGINE_TEXT_FIELDS = ["ttsModel", "ttsElevenLabsModel", "ttsAzureRegion", "ttsCustomUrl", "ttsCustomModel"];
+function withEngineOverride(site, engine) {
+  const base = site ? { ...(site.toObject ? site.toObject() : site) } : {};
+  if (!engine || typeof engine !== "object") return site;
+  const p = String(engine.ttsProvider || "").trim().toLowerCase();
+  if (TTS_PROVIDERS.includes(p)) base.ttsProvider = p;
+  for (const f of ENGINE_TEXT_FIELDS) {
+    if (typeof engine[f] === "string") base[f] = engine[f].trim().slice(0, 300);
+  }
+  for (const f of Object.values(TTS_KEY_FIELDS)) {
+    const k = typeof engine[f] === "string" ? engine[f].trim() : "";
+    if (k) base[f] = k.slice(0, 500);
+  }
+  return base;
+}
+
+// In-memory registry of test-slideshow jobs (admin previews only — nothing is
+// published, so losing one on a restart just means "click Generate again").
+// Entries expire after an hour.
+const slideshowJobs = new Map();
+const SLIDESHOW_JOB_TTL_MS = 60 * 60 * 1000;
+function newSlideshowJob(ownerId) {
+  const now = Date.now();
+  for (const [id, j] of slideshowJobs) if (now - j.updatedAt > SLIDESHOW_JOB_TTL_MS) slideshowJobs.delete(id);
+  const id = randomUUID();
+  slideshowJobs.set(id, { status: "running", stage: "PENDING", owner: ownerId ? String(ownerId) : "", createdAt: now, updatedAt: now });
+  return id;
+}
+
+// GET /api/facebook/slideshow/test/:jobId  (admin) — poll a test job.
+// → { status: "running", stage, progress: { done, total } | null } | { status: "done", ...result } | { status: "failed", message }
+export function testSlideshowStatus(req, res) {
+  const job = slideshowJobs.get(String(req.params.jobId || ""));
+  // Only the admin who started the job can read it.
+  if (!job || (job.owner && job.owner !== String(req.user?._id || ""))) {
+    return res.status(404).json({ success: false, message: "Test job not found (it may have expired — generate again)." });
+  }
+  if (job.status === "done") return res.json({ status: "done", stage: job.stage, ...job.result });
+  if (job.status === "failed") return res.json({ status: "failed", stage: job.stage, success: false, message: job.error });
+  return res.json({ status: "running", stage: job.stage, progress: job.progress || null });
+}
+
+// GET /api/facebook/tts-voices  (admin) — the TTS providers and their voices, so
+// the UI never hard-codes lists that can drift from the server. The current
+// provider + "key saved" flag come from the site settings (safeSettings).
+export async function ttsVoices(_req, res) {
+  // Your own cloned voices (Voice Studio), listed live from your voice server.
+  const site = await getOrCreateOwn().catch(() => null);
+  const myvoice = await myVoiceOptions(voiceOwnerFor(site));
+  res.json({
+    providers: TTS_PROVIDERS,
+    defaultProvider: DEFAULT_TTS_PROVIDER,
+    voicesByProvider: { ...PROVIDER_VOICES, myvoice },
+    // Back-compat: a flat default list (the edge/free provider's voices).
+    voices: PROVIDER_VOICES[DEFAULT_TTS_PROVIDER],
+  });
+}
+
+// GET /api/facebook/suggest-tags/:id — hashtags for one question (global default
+// + auto tags from its subject/topic/section). Used to pre-fill the post modal.
+export async function suggestTags(req, res) {
+  const q = await Question.findById(req.params.id).lean();
+  if (!q) return res.json({ hashtags: "" });
+  const site = await Settings.findOne(socialSettingsFilter()).lean().catch(() => null);
+  res.json({ hashtags: await hashtagsForQuestion(q, site, "") });
+}
+
+// Common post-format fields from the per-question modal.
+function postOpts(body = {}) {
+  return {
+    // "flashcard" posts the two-panel flashcard image (question + answer on the
+    // uploaded template); "question" posts the normal question card.
+    kind: body.kind === "flashcard" ? "flashcard" : "question",
+    toFacebook: body.toFacebook !== false,
+    toInstagram: !!body.toInstagram,
+    asImage: !!body.asImage,
+    includeOptions: body.includeOptions !== false,
+    includeAnswer: !!body.includeAnswer,
+    includeLink: !!body.includeLink,
+    hashtags: String(body.hashtags || "").trim(),
+    // Save the Facebook post as a Page draft instead of publishing it.
+    fbDraft: !!body.fbDraft,
+    // Pre-captured, client-rendered screenshot (exactly what students see). When
+    // present the poster uses it instead of the server-drawn card.
+    imageUrl: String(body.imageUrl || "").trim(),
+  };
+}
+
+// Only the fields an admin may set on a schedule (whitelist).
+// Slideshow slide time in whole seconds, 3–40 (two slides then stay well inside
+// the 90 s Reel limit). Falls back to `def` when missing/invalid.
+function clampSlideSec(v, def) {
+  const n = Math.round(Number(v));
+  return Number.isFinite(n) && n > 0 ? Math.max(3, Math.min(40, n)) : def;
+}
+
+// How many questions go in one slideshow video: whole number 1–10 (default 1).
+function clampQuestionCount(v) {
+  const n = Math.round(Number(v));
+  return Number.isFinite(n) && n > 0 ? Math.min(10, n) : 1;
+}
+
+// Exported for unit tests (pure, no I/O).
+export function pickScheduleFields(body = {}) {
+  const src = body.source || {};
+  const cleanId = (v) => (v ? v : null);
+  let kind = ["custom", "flashcard", "slideshow", "longvideo"].includes(body.kind) ? body.kind : "question";
+  const isLongVideo = kind === "longvideo";
+  const longVideo = isLongVideo ? pickLongVideoScheduleFields(body.longVideo || {}) : null;
+  // Older schedules stored the slideshow as a toggle on a "question" post. Keep
+  // them slideshows when they're re-saved (e.g. the list's pause/enable button
+  // sends the stored row back as-is).
+  if (kind === "question" && body.asSlideshow === true) kind = "slideshow";
+  const isSlideshow = kind === "slideshow";
+  const mode = body.mode === "once" ? "once" : "recurring";
+  // Custom media: keep only well-formed http(s) URLs (from the Cloudinary uploader), max 10.
+  const customMedia = Array.isArray(body.customMedia)
+    ? body.customMedia.map((u) => String(u || "").trim()).filter((u) => /^https?:\/\//i.test(u)).slice(0, 10)
+    : [];
+  // Custom video (for a Reel post): a single public http(s) URL, else dropped.
+  const rawVideo = String(body.customVideo || "").trim();
+  const customVideo = /^https?:\/\//i.test(rawVideo) && isSafePublicUrl(rawVideo) ? rawVideo : "";
+  // Reel music library (for question/flashcard Reels): a list of public http(s)
+  // URLs the schedule rotates through. Keep only safe URLs, dedupe, cap at 20.
+  // Falls back to a legacy single `customAudio` when no array is supplied.
+  const rawAudios = Array.isArray(body.customAudios)
+    ? body.customAudios
+    : (body.customAudio ? [body.customAudio] : []);
+  const customAudios = [...new Set(
+    rawAudios
+      .map((u) => String(u || "").trim())
+      .filter((u) => /^https?:\/\//i.test(u) && isSafePublicUrl(u))
+  )].slice(0, 20);
+  // Keep the first track in the legacy field too, so older readers still work.
+  const customAudio = customAudios[0] || "";
+  return {
+    title: String(body.title || "").trim(),
+    enabled: body.enabled !== false,
+    kind,
+    source: {
+      label: String(src.label || "").trim(),
+      subject: cleanId(src.subject),
+      session: cleanId(src.session),
+      quiz: cleanId(src.quiz),
+      testSeries: cleanId(src.testSeries),
+      topic: cleanId(src.topic),
+      practiceTopic: cleanId(src.practiceTopic),
+    },
+    customText: String(body.customText || "").trim().slice(0, 5000),
+    customMedia,
+    customVideo,
+    mode,
+    // One-off run time (only meaningful when mode === "once").
+    runAt: mode === "once" && body.runAt && !isNaN(new Date(body.runAt).getTime()) ? new Date(body.runAt) : null,
+    // Repeating schedule: first fire no earlier than this (null = right away).
+    startAt: mode === "recurring" && body.startAt && !isNaN(new Date(body.startAt).getTime()) ? new Date(body.startAt) : null,
+    times: Array.isArray(body.times)
+      ? body.times.map((t) => String(t).trim()).filter((t) => /^\d{1,2}:\d{2}$/.test(t)).slice(0, 20)
+      : [],
+    days: Array.isArray(body.days) ? body.days.map(Number).filter((d) => d >= 0 && d <= 6) : [],
+    timezone: String(body.timezone || "Asia/Kolkata").trim() || "Asia/Kolkata",
+    includeOptions: body.includeOptions !== false,
+    includeAnswer: !!body.includeAnswer,
+    includeLink: !!body.includeLink,
+    hashtags: String(body.hashtags || "").trim(),
+    order: body.order === "sequential" ? "sequential" : "random",
+    stopWhenExhausted: body.stopWhenExhausted !== false, // default true: stop once every question posted
+    // A long-video schedule's destinations come from its own settings.
+    toFacebook: isLongVideo ? !!longVideo.options.toFacebook : body.toFacebook !== false,
+    toInstagram: isLongVideo ? false : !!body.toInstagram,
+    // Telegram: question / flashcard image, Reel / Short / slideshow video, or
+    // for a long video the link to it.
+    toTelegram: isLongVideo ? !!longVideo.options.toTelegram : !!body.toTelegram,
+    toYoutube: isLongVideo ? !!longVideo.options.toYoutube : !!body.toYoutube,
+    longVideo,
+    ytTitle: String(body.ytTitle || "").replace(/[<>]/g, "").trim().slice(0, 90),
+    ytFullVideo: !!body.toYoutube && !!body.ytFullVideo,
+    ytPlaylistId: body.toYoutube ? cleanYtPlaylistId(body.ytPlaylistId) : "",
+    ytPlaylistTitle: body.toYoutube && cleanYtPlaylistId(body.ytPlaylistId) ? String(body.ytPlaylistTitle || "").replace(/[<>]/g, "").trim().slice(0, 150) : "",
+    asImage: !!body.asImage,
+    // Post question/flashcard runs as a Reel by mixing the card image with music.
+    // (A slideshow is its own narrated Reel, so it never uses the music Reel.)
+    asReel: isSlideshow ? false : !!body.asReel,
+    // Reel length in seconds — clamp to Instagram's accepted 3–90 s window
+    // (below 3 s Instagram rejects the publish with a "Fatal" container).
+    reelDuration: Math.max(3, Math.min(90, Math.round(Number(body.reelDuration) || 30))),
+    // Also share the card image as a 24h Story to the selected networks.
+    asStory: !!body.asStory,
+    // Save the Facebook post / Reel / slideshow as a Page draft.
+    fbDraft: !!body.fbDraft,
+    // AI Slideshow post type: a narrated 2-slide 9:16 Reel (question → answer)
+    // built from the selected question. Derived from the post type.
+    asSlideshow: isSlideshow,
+    // Seconds each slide stays on screen (minimum — it stays longer if the
+    // narration needs it). Clamped so the two slides fit a Reel.
+    questionSec: clampSlideSec(body.questionSec, 10),
+    answerSec: clampSlideSec(body.answerSec, 8),
+    // Questions per slideshow video (1–10).
+    slideshowQuestions: clampQuestionCount(body.slideshowQuestions),
+    // Narration voice — kept as a trimmed string (voices are provider-specific,
+    // so it's normalised against the effective provider at generation time).
+    ttsVoice: String(body.ttsVoice || "").trim().slice(0, 60),
+    // Burn readable captions onto each slide (default ON).
+    autoCaptions: body.autoCaptions !== false,
+    // Generate AI illustrations per slide (default OFF for cost control).
+    generateImages: !!body.generateImages,
+    customAudios,
+    customAudio,
+    // Reset the rotation pointer when the caller sends one (e.g. after editing
+    // the track list); otherwise leave it for the scheduler to advance.
+    ...(Number.isInteger(body.audioIndex) ? { audioIndex: Math.max(0, body.audioIndex) } : {}),
+  };
+}
+
+// Shared validation for create/update. Returns an error message string, or "".
+// Exported for unit tests (pure, no I/O).
+export function validateScheduleData(data) {
+  if (data.kind === "longvideo" && data.longVideo?.options?.marathon && !isTopicLevelSource(data.source)) {
+    return "A Marathon video needs a whole TOPIC (all its quizzes) — pick a topic, not a single quiz.";
+  }
+  if (data.kind === "custom") {
+    if (!data.customText && !data.customMedia.length && !data.customVideo) {
+      return "Add some text, upload an image, or add a video (Reel) for the custom post.";
+    }
+  } else if (!data.source.subject && !data.source.session && !data.source.quiz && !data.source.testSeries && !data.source.topic && !data.source.practiceTopic) {
+    return "Pick a source (a subject, session, quiz or test) to draw questions from.";
+  }
+  if (data.kind === "longvideo" && !longVideoTargets(data.longVideo?.options || {}).any) {
+    return "Choose where to post: the YouTube long video and/or YouTube Short, Facebook, or a Reel.";
+  }
+  if (data.kind === "longvideo" && data.longVideo?.options?.marathon && longVideoTargets(data.longVideo.options).shortOnly) {
+    return "A Marathon is one long video — tick the YouTube long video or Facebook.";
+  }
+  if (data.kind === "longvideo" && data.longVideo?.byQuiz && (data.source.quiz || data.source.testSeries)) {
+    return "“Quiz by quiz” goes through a whole topic — pick the topic, not a single quiz.";
+  }
+  // NOTE: Reel mode (asReel) no longer requires per-schedule audio — the music
+  // comes from the SHARED library on site settings (fbReelAudios). The admin UI
+  // guides the user to add tracks there; at post time an empty library simply
+  // falls back to a normal image/text post.
+  if (data.mode === "once") {
+    if (!data.runAt) return "Pick a valid date & time for the one-off post.";
+  } else if (!data.times.length) {
+    return "Add at least one time (HH:MM).";
+  }
+  return "";
+}
+
+// GET /api/facebook/schedules — list schedules (admin), paginated + searchable.
+// Query: ?page=1&limit=20&q=<title/source search>. Returns { items, total,
+// page, limit } so the admin panel can page through 100s of schedules.
+// "8:00" / "08:00" → minutes since midnight (0–1439), or null if invalid.
+function hhmmToMin(s) {
+  const m = /^(\d{1,2}):(\d{2})$/.exec(String(s || "").trim());
+  if (!m) return null;
+  const h = +m[1], mi = +m[2];
+  if (h > 23 || mi > 59) return null;
+  return h * 60 + mi;
+}
+
+// The minute-of-day value(s) at which a schedule fires — its recurring `times`,
+// or the one-off `runAt` converted to the schedule's own timezone. Used for the
+// time-of-day filter and sort.
+function scheduleFireMinutes(sch) {
+  if (sch.mode === "once") {
+    if (!sch.runAt) return [];
+    try {
+      const f = new Intl.DateTimeFormat("en-GB", { timeZone: sch.timezone || "Asia/Kolkata", hour12: false, hour: "2-digit", minute: "2-digit" });
+      const p = Object.fromEntries(f.formatToParts(new Date(sch.runAt)).map((x) => [x.type, x.value]));
+      const h = p.hour === "24" ? 0 : +p.hour;
+      return [h * 60 + (+p.minute)];
+    } catch { return []; }
+  }
+  return (sch.times || []).map(hhmmToMin).filter((m) => m != null);
+}
+
+// GET /api/facebook/schedules — list schedules (admin), paginated + searchable.
+// Query: ?page=1&limit=20&q=<search>&from=HH:MM&to=HH:MM&sort=recent|time.
+//   from/to  — keep only schedules that fire within this time-of-day window
+//              (wrapping past midnight is supported, e.g. 22:00→01:00). Also
+//              returns postsInRange = how many individual posts fall in it.
+//   sort     — "time" orders by earliest fire time of day; default is newest first.
+export async function listSchedules(req, res) {
+  await ensureProfileIdBackfill();
+  const page = Math.max(1, parseInt(req.query.page, 10) || 1);
+  const limit = Math.max(1, Math.min(100, parseInt(req.query.limit, 10) || 20));
+  const q = String(req.query.q || "").trim();
+  const filter = { ...scheduleProfileFilter() }; // only THIS account's schedules (main or a cross-posting user)
+  if (q) {
+    const rx = new RegExp(q.replace(/[.*+?^${}()|[\]\\]/g, "\\$&"), "i");
+    filter.$or = [{ title: rx }, { "source.label": rx }];
+  }
+
+  const fromMin = hhmmToMin(req.query.from);
+  const toMin = hhmmToMin(req.query.to);
+  const rangeActive = fromMin != null && toMin != null;
+  const sort = req.query.sort === "time" ? "time" : "recent";
+
+  // Fast path (no time filter/sort): let the DB paginate, as before.
+  if (!rangeActive && sort !== "time") {
+    const total = await FbSchedule.countDocuments(filter);
+    const items = await FbSchedule.find(filter).sort({ createdAt: -1 }).skip((page - 1) * limit).limit(limit).lean();
+    return res.json({ items, total, page, limit });
+  }
+
+  // Time filter / sort-by-time need every field, so load the search-matched set
+  // and do it in memory (schedule counts are modest, and each doc is small).
+  let all = await FbSchedule.find(filter).lean();
+  let postsInRange = 0;
+  if (rangeActive) {
+    const inRange = (m) => (fromMin <= toMin ? m >= fromMin && m <= toMin : m >= fromMin || m <= toMin);
+    all = all.filter((s) => {
+      const hits = scheduleFireMinutes(s).filter(inRange);
+      postsInRange += hits.length;
+      return hits.length > 0;
+    });
+  }
+  const earliest = (s) => { const mins = scheduleFireMinutes(s); return mins.length ? Math.min(...mins) : Infinity; };
+  all.sort(sort === "time"
+    ? (a, b) => earliest(a) - earliest(b) || new Date(b.createdAt) - new Date(a.createdAt)
+    : (a, b) => new Date(b.createdAt) - new Date(a.createdAt));
+
+  const total = all.length;
+  const items = all.slice((page - 1) * limit, (page - 1) * limit + limit);
+  res.json({ items, total, page, limit, ...(rangeActive ? { postsInRange } : {}) });
+}
+
+// GET /api/facebook/stats — reliable LIFETIME Facebook publication count + a few
+// recent entries, read from the permanent ledger (FbPost). This survives schedule
+// deletion, unlike a schedule's own postCount.
+export async function facebookStats(req, res) {
+  await ensureProfileIdBackfill();
+  // Scope to the tenant's CURRENTLY connected Page so one Page's (or tenant's)
+  // posts never inflate another's count. Both "lifetime" here and the
+  // reconciliation's applicationCount resolve through the SAME authoritative
+  // function, countFacebookPosts(tenantId, pageId) — never a second counter.
+  const cfg = await getFacebookConfig();
+  const pageId = cfg.pageId || "";
+  const tenantId = getCurrentTenantId();
+  const [lifetime, recent] = await Promise.all([
+    countFacebookPosts(tenantId, pageId),
+    FbPost.find({ ...scheduleProfileFilter(), ...(pageId ? { pageId } : {}) }).sort({ createdAt: -1 }).limit(5).lean(),
+  ]);
+  res.json({
+    lifetime,
+    pageId,
+    recent: recent.map((p) => ({
+      facebookPostId: p.facebookPostId,
+      pageLabel: p.pageLabel || "",
+      scheduleTitle: p.scheduleTitle || "",
+      sourceLabel: p.sourceLabel || "",
+      kind: p.kind || "question",
+      postedAt: p.createdAt,
+    })),
+  });
+}
+
+// GET /api/facebook/reconcile — DIAGNOSTIC ONLY. Reports our authoritative
+// application count (the FbPost ledger) alongside the remote figure Meta's API
+// returns for the connected Page, so an admin can SPOT drift. It never mutates
+// the application count: the remote number is NOT imported, NOT treated as our
+// lifetime total, and NOT treated as the Page's authoritative post count. The
+// remote value is Meta's published_posts.summary.total_count — a remote summary
+// that also includes posts made outside this application (see
+// FACEBOOK_COUNT_ARCHITECTURE.md).
+export async function reconcileFacebook(req, res) {
+  const cfg = await getFacebookConfig();
+  const tenantId = getCurrentTenantId();
+  // Authoritative application count — the SAME source as "Published by this
+  // application". Read-only.
+  const applicationCount = await countFacebookPosts(tenantId, cfg.pageId || "");
+  const lastReconciledAt = new Date().toISOString();
+
+  // Base diagnostic payload. `remoteOnly` / `ledgerOnly` are only knowable from
+  // an enumerated remote id list; the current Meta request returns a summary
+  // total only, so they are reported as null (undetermined) rather than guessed.
+  const base = {
+    applicationCount,
+    remoteApiCount: null,
+    remoteOnly: null,
+    ledgerOnly: null,
+    drift: null,
+    lastReconciledAt,
+    remoteCountKind: "meta_published_posts_summary_total_count",
+    note: "Remote count is a non-authoritative Meta summary that also includes posts published outside this application. It is not the application's lifetime count.",
+    // Back-compat aliases for existing clients.
+    ours: applicationCount,
+    facebook: null,
+  };
+
+  if (!cfg.pageId || !cfg.token) {
+    return res.json({ ...base, status: "remote_unavailable", error: "Connect Facebook first (Page ID + token)." });
+  }
+
+  const r = await getFacebookPublishedCount(cfg);
+  if (!r.ok || typeof r.count !== "number") {
+    return res.json({ ...base, status: "remote_unavailable", error: r.error || "Facebook count unavailable." });
+  }
+
+  const remoteApiCount = r.count;
+  const drift = remoteApiCount - applicationCount;
+  res.json({
+    ...base,
+    remoteApiCount,
+    facebook: remoteApiCount, // back-compat alias
+    drift,
+    status: drift === 0 ? "in_sync" : "drift_detected",
+  });
+}
+
+// POST /api/facebook/schedules — create (admin)
+export async function createSchedule(req, res) {
+  const data = pickScheduleFields(req.body);
+  const err = validateScheduleData(data);
+  if (err) return res.status(400).json({ message: err });
+  // Stagger Reel music: start each new Reel schedule at a RANDOM point in the
+  // shared library (nextReelAudio takes it modulo the library size), so two
+  // schedules don't both begin on the same first track ("same music"). Rotation
+  // then advances normally from there.
+  if (data.asReel && !Number.isInteger(data.audioIndex)) {
+    data.audioIndex = Math.floor(Math.random() * 1000);
+  }
+  const sch = await FbSchedule.create({ ...data, profileId: activeSocialProfileId(), createdBy: req.user?._id || null });
+  res.status(201).json(sch);
+}
+
+// PUT /api/facebook/schedules/:id — update (admin)
+export async function updateSchedule(req, res) {
+  const data = pickScheduleFields(req.body);
+  const err = validateScheduleData(data);
+  if (err) return res.status(400).json({ message: err });
+  const prev = await FbSchedule.findOne({ _id: req.params.id, ...scheduleProfileFilter() }).lean();
+  if (!prev) return res.status(404).json({ message: "Schedule not found." });
+  // Switching a COMPLETED schedule back on: it's no longer completed (the list
+  // showed "Completed" forever, so there was no way to see it was on again).
+  if (data.enabled && prev.completedAt) {
+    if (data.kind === "longvideo" && data.longVideo?.byQuiz) {
+      // Quiz by quiz: say NOW if there's nothing left to make, instead of the
+      // next run silently marking it Completed again.
+      const { list, next } = await planByQuizNext({ ...prev, ...data, stopWhenExhausted: data.stopWhenExhausted ?? prev.stopWhenExhausted }).catch(() => ({ list: [], next: { done: false } }));
+      if (next?.done) {
+        const names = list.map((q) => q.name).filter(Boolean);
+        return res.status(400).json({
+          message: list.length
+            ? `Nothing left to make: this topic has ${list.length} quiz${list.length === 1 ? "" : "zes"} (${names.slice(0, 5).join(", ")}${names.length > 5 ? ", …" : ""}) and every one after the start quiz is already made (or has no complete questions). Add the next quiz to this topic (with complete questions), or tap Edit → “Continue from quiz” to make a quiz again.`
+            : "This topic has no quizzes with complete questions.",
+        });
+      }
+    }
+    data.completedAt = null;
+  }
+  const sch = await FbSchedule.findOneAndUpdate({ _id: req.params.id, ...scheduleProfileFilter() }, data, { new: true });
+  if (!sch) return res.status(404).json({ message: "Schedule not found." });
+  res.json(sch);
+}
+
+// GET /api/facebook/schedules/live?ids=a,b,c → { jobs: { [scheduleId]: job } }
+// Live progress (%, step, start time) of the long videos these schedules are
+// making now. Only ids the admin can see count (normal tenant-scoped query).
+export async function liveScheduleProgress(req, res) {
+  const ids = String(req.query.ids || "").split(",").map((s) => s.trim()).filter((s) => /^[a-f0-9]{24}$/i.test(s)).slice(0, 100);
+  if (!ids.length) return res.json({ jobs: {} });
+  const visible = await FbSchedule.find({ _id: { $in: ids }, ...scheduleProfileFilter() }).select("_id").lean();
+  res.json({ jobs: activeJobsForSchedules(visible.map((s) => String(s._id))) });
+}
+
+// DELETE /api/facebook/schedules/:id — delete (admin)
+export async function deleteSchedule(req, res) {
+  const gone = await FbSchedule.findOneAndDelete({ _id: req.params.id, ...scheduleProfileFilter() });
+  // Stop any video this schedule is still making / waiting to make.
+  if (gone) {
+    cancelJobsForSchedules([String(gone._id)]);
+    await rememberDeletedCopies([gone]);
+  }
+  res.json({ ok: true });
+}
+
+// Ids of every schedule matching the SAME search + time-of-day filter the list
+// uses (listSchedules), across all pages. Backs "Select all N schedules".
+async function matchingScheduleIds({ q, from, to } = {}) {
+  const filter = { ...scheduleProfileFilter() };
+  const term = String(q || "").trim();
+  if (term) {
+    const rx = new RegExp(term.replace(/[.*+?^${}()|[\]\\]/g, "\\$&"), "i");
+    filter.$or = [{ title: rx }, { "source.label": rx }];
+  }
+  const fromMin = hhmmToMin(from);
+  const toMin = hhmmToMin(to);
+  if (fromMin == null || toMin == null) {
+    return (await FbSchedule.find(filter).select("_id").lean()).map((s) => String(s._id));
+  }
+  const inRange = (m) => (fromMin <= toMin ? m >= fromMin && m <= toMin : m >= fromMin || m <= toMin);
+  const all = await FbSchedule.find(filter).lean();
+  return all.filter((s) => scheduleFireMinutes(s).some(inRange)).map((s) => String(s._id));
+}
+
+// POST /api/facebook/schedules/bulk — pause / resume / delete MANY schedules at
+// once (admin). Body:
+//   { action: "pause" | "resume" | "delete",
+//     ids?: [scheduleId, …],          — the ticked schedules, OR
+//     all?: true, q?, from?, to?,     — every schedule matching the list's current
+//     exclude?: [scheduleId, …] }       search / time filter (all pages), minus
+//                                       any the admin unticked afterwards.
+// Returns { ok, action, matched, affected }.
+const BULK_SCHEDULE_ACTIONS = ["pause", "resume", "delete"];
+const MAX_BULK_SCHEDULE_IDS = 5000;
+export async function bulkSchedules(req, res) {
+  const action = String(req.body?.action || "");
+  if (!BULK_SCHEDULE_ACTIONS.includes(action)) {
+    return res.status(400).json({ message: "Unknown action. Use pause, resume or delete." });
+  }
+  let ids;
+  if (req.body?.all === true) {
+    ids = await matchingScheduleIds(req.body);
+    // "Select all pages" then untick a few → those are sent as `exclude`.
+    const exclude = new Set(
+      (Array.isArray(req.body?.exclude) ? req.body.exclude : []).map((x) => String(x || "").trim()).filter(Boolean)
+    );
+    if (exclude.size) ids = ids.filter((id) => !exclude.has(id));
+  } else {
+    const raw = Array.isArray(req.body?.ids) ? req.body.ids : [];
+    ids = [...new Set(raw.map((x) => String(x || "").trim()).filter(Boolean))];
+    if (!ids.length) return res.status(400).json({ message: "Select at least one schedule." });
+    if (ids.length > MAX_BULK_SCHEDULE_IDS) return res.status(400).json({ message: `Too many schedules at once (max ${MAX_BULK_SCHEDULE_IDS}).` });
+  }
+  if (!ids.length) return res.json({ ok: true, action, matched: 0, affected: 0 });
+
+  const filter = { _id: { $in: ids }, ...scheduleProfileFilter() };
+  let affected = 0;
+  try {
+    if (action === "delete") {
+      const doomed = await FbSchedule.find(filter).select("_id profileId copiedFrom").lean();
+      const r = await FbSchedule.deleteMany(filter);
+      affected = r?.deletedCount ?? 0;
+      cancelJobsForSchedules(doomed.map((s) => String(s._id)));
+      await rememberDeletedCopies(doomed);
+    } else {
+      // Resuming also clears "Completed" (the schedule is running again).
+      const r = await FbSchedule.updateMany(filter, { $set: action === "resume" ? { enabled: true, completedAt: null } : { enabled: false } });
+      affected = r?.modifiedCount ?? r?.matchedCount ?? 0;
+    }
+  } catch (e) {
+    if (e?.name === "CastError") return res.status(400).json({ message: "One or more schedule ids are invalid." });
+    throw e;
+  }
+  res.json({ ok: true, action, matched: ids.length, affected });
+}
+
+// Rebuild the "My Quiz › Stream › Subject › Topic › Item" breadcrumb for a
+// practice (My Quiz) source from the live hierarchy. Older schedules stored a
+// label built before the TOPIC level was included, so it was missing; this
+// re-derives the full trail. Returns the corrected label, or "" when it can't
+// / shouldn't be rebuilt (e.g. the source isn't a My Quiz item).
+async function rebuildPracticeLabel(source = {}) {
+  if (!source.testSeries) return "";
+  const ts = await TestSeries.findById(source.testSeries)
+    .select("name practice practiceStream practiceSubject practiceTopic")
+    .lean()
+    .catch(() => null);
+  if (!ts || !ts.practice) return ""; // only My Quiz items; leave anything else untouched
+  const [stream, subject, topic] = await Promise.all([
+    ts.practiceStream ? PracticeStream.findById(ts.practiceStream).select("name").lean().catch(() => null) : null,
+    ts.practiceSubject ? PracticeSubject.findById(ts.practiceSubject).select("name").lean().catch(() => null) : null,
+    ts.practiceTopic ? PracticeTopic.findById(ts.practiceTopic).select("name").lean().catch(() => null) : null,
+  ]);
+  return ["My Quiz", stream?.name, subject?.name, topic?.name, ts.name].filter(Boolean).join(" › ");
+}
+
+// POST /api/facebook/schedules/backfill-labels — one-off maintenance (admin).
+// Re-derives the source breadcrumb for existing "My Quiz" schedules so the
+// TOPIC level (dropped by schedules created before it was included) shows again.
+// Idempotent: only rows whose label actually changed are written. Quiz-Bank,
+// custom and single-question schedules are left untouched.
+export async function backfillScheduleLabels(req, res) {
+  const schedules = await FbSchedule.find({ ...scheduleProfileFilter() }).select("source kind").lean();
+  let updated = 0;
+  for (const s of schedules) {
+    if (s.kind === "custom" || !s.source?.testSeries || s.source?.question) continue;
+    const label = await rebuildPracticeLabel(s.source);
+    if (label && label !== s.source?.label) {
+      // Write back the WHOLE source (spread) so every existing id is preserved
+      // and we avoid engine-specific dotted-path update quirks.
+      await FbSchedule.updateOne({ _id: s._id }, { $set: { source: { ...s.source, label } } }).catch(() => {});
+      updated += 1;
+    }
+  }
+  res.json({ ok: true, scanned: schedules.length, updated });
+}
+
+// POST /api/facebook/schedules/:id/post-now — post one question immediately (admin)
+export async function postScheduleNow(req, res) {
+  const sch = await FbSchedule.findOne({ _id: req.params.id, ...scheduleProfileFilter() });
+  if (!sch) return res.status(404).json({ message: "Schedule not found." });
+  const cfg = await getFacebookConfig();
+  const ytReady = !!sch.toYoutube && isYoutubeConfigured(cfg);
+  if ((!cfg.pageId || !cfg.token) && !ytReady) {
+    return res.status(400).json({ ok: false, error: sch.toYoutube ? "Connect Facebook or YouTube first." : "Connect Facebook first (Page ID + token) and enable posting." });
+  }
+  const result = await runScheduleOnce(sch, cfg);
+  // Disappear-on-success: remove a one-time post, or a recurring
+  // question/slideshow schedule that just finished its whole pool, once it has
+  // published successfully. Failures are kept so the admin can retry. A
+  // completed LONG-VIDEO schedule is KEPT (marked "Completed", paused) so it
+  // stays visible and reportToSchedule can still update it when the video posts.
+  if (result.ok && (sch.mode === "once" || (result.completed && sch.kind !== "longvideo"))) {
+    await FbSchedule.deleteOne({ _id: sch._id }).catch(() => {});
+  } else {
+    await sch.save().catch(() => {});
+  }
+  return res.status(result.ok ? 200 : 502).json(result);
+}
+
+// POST /api/facebook/post-question — post ONE specific question right now (admin)
+// Body: { questionId, toFacebook?, toInstagram?, asImage?, includeOptions?, includeAnswer?, hashtags? }
+export async function postQuestionNow(req, res) {
+  const questionId = req.body?.questionId;
+  if (!questionId) return res.status(400).json({ ok: false, error: "Missing questionId." });
+  const cfg = await getFacebookConfig();
+  if (!cfg.pageId || !cfg.token) return res.status(400).json({ ok: false, error: "Connect Facebook first (Page ID + token) and enable posting." });
+  const exists = await Question.exists({ _id: questionId });
+  if (!exists) return res.status(404).json({ ok: false, error: "Question not found." });
+
+  // A transient (unsaved) schedule-like object drives the same posting logic.
+  const transient = { source: { question: questionId }, order: "random", postedQuestionIds: [], ...postOpts(req.body) };
+  const result = await runScheduleOnce(transient, cfg);
+  return res.status(result.ok ? 200 : 502).json(result);
+}
+
+// POST /api/facebook/preview-image — render the question card image and return
+// its URL (no posting). Used for the live preview in the post/schedule modal.
+export async function previewQuestionImage(req, res) {
+  const { questionId } = req.body || {};
+  if (!questionId) return res.status(400).json({ message: "Missing questionId." });
+  const q = await Question.findById(questionId).lean();
+  if (!q) return res.status(404).json({ message: "Question not found." });
+
+  const includeAnswer = !!req.body.includeAnswer;
+  const hashtags = String(req.body.hashtags || "").trim();
+  const site = await Settings.findOne(socialSettingsFilter()).lean().catch(() => null);
+
+  // Flashcard image (for the admin's Flashcard Details "Download") — the SAME
+  // two-panel flashcard the auto-post produces, on the uploaded template.
+  if (req.body.kind === "flashcard") {
+    const templateUrl = site?.fbFlashcardTemplateEnabled !== false ? String(site?.fbFlashcardTemplateUrl || "").trim() : "";
+    const fc = await renderFlashcardCardShot(q, { templateUrl }).catch((e) => ({ error: e?.message || String(e) }));
+    if (fc?.url) return res.json({ url: fc.url });
+    return res.status(502).json({ message: fc?.error || "Could not generate the flashcard image." });
+  }
+
+  // Preview the SAME image that actually gets posted: a screenshot of the REAL
+  // /q-card page (pixel-identical to the on-screen quiz card and to what the
+  // auto-post schedule posts), with the same selfie/text watermarks baked in.
+  // Fall back to the lightweight SVG card ONLY if the headless screenshot is
+  // unavailable, so the preview never simply fails.
+  const selfieOn = site?.fbSelfieWatermarkEnabled !== false && !!site?.fbSelfieWatermarkUrl;
+  const textWmText = String(site?.fbTextWatermarkText || site?.watermarkText || site?.siteName || "").trim();
+  const textOn = site?.fbTextWatermarkEnabled === true && !!textWmText;
+
+  const shot = await renderQuestionCardShot(q, {
+    includeAnswer,
+    cta: !includeAnswer, // "Comment your answer!" when the answer is hidden — mirrors the post
+    watermark: selfieOn
+      ? {
+          url: site.fbSelfieWatermarkUrl,
+          size: site.fbSelfieWatermarkSize || 120,
+          opacity: site.fbSelfieWatermarkOpacity || 90,
+          position: site.fbSelfieWatermarkPosition || "bottom-right",
+          shape: site.fbSelfieWatermarkShape || "circle",
+        }
+      : null,
+    textWatermark: textOn
+      ? { text: textWmText, size: site.fbTextWatermarkSize || 64, opacity: site.fbTextWatermarkOpacity || 12 }
+      : null,
+  }).catch((e) => ({ error: e?.message || String(e) }));
+  if (shot?.url) return res.json({ url: shot.url });
+
+  // Fallback: server-drawn SVG card (also honours the "Show options" toggle).
+  const r = await renderQuestionImage(q, {
+    includeOptions: req.body.includeOptions !== false,
+    includeAnswer,
+    hashtags,
+  });
+  if (!r.url) return res.status(502).json({ message: r.error || shot?.error || "Could not generate the image." });
+  res.json({ url: r.url });
+}
+
+// POST /api/facebook/schedule-question — schedule ONE specific question at a
+// date/time (admin). Body: { questionId, runAt, label?, ...postOpts }
+export async function scheduleQuestion(req, res) {
+  const { questionId, runAt } = req.body || {};
+  if (!questionId) return res.status(400).json({ message: "Missing questionId." });
+  if (!runAt || isNaN(new Date(runAt).getTime())) return res.status(400).json({ message: "Pick a valid date & time." });
+  const exists = await Question.exists({ _id: questionId });
+  if (!exists) return res.status(404).json({ message: "Question not found." });
+
+  const sch = await FbSchedule.create({
+    title: String(req.body.title || "").trim() || "Scheduled question",
+    enabled: true,
+    mode: "once",
+    runAt: new Date(runAt),
+    source: { question: questionId, label: String(req.body.label || "Single question").slice(0, 120) },
+    times: [], days: [], timezone: String(req.body.timezone || "Asia/Kolkata"),
+    order: "random",
+    ...postOpts(req.body), // includes the pre-captured imageUrl (posted at run time)
+    profileId: activeSocialProfileId(), // a cross-posting user's own accounts ("" = main)
+    createdBy: req.user?._id || null,
+  });
+  res.status(201).json(sch);
+}

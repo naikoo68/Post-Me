@@ -1,0 +1,42 @@
+import { Router } from "express";
+import { listSchedules, liveScheduleProgress, createSchedule, updateSchedule, deleteSchedule, bulkSchedules, postScheduleNow, postQuestionNow, scheduleQuestion, previewQuestionImage, suggestTags, backfillScheduleLabels, facebookStats, reconcileFacebook, composeReel, testSlideshow, testSlideshowStatus, ttsVoices } from "../controllers/facebookController.js";
+import { protect, authorize } from "../middleware/auth.js";
+
+const router = Router();
+// Each institute connects its OWN Facebook/Instagram page. Allow institute
+// admins too; every route is tenant-scoped, so an institute only sees/uses its
+// own schedules, credentials (in its settings) and content.
+const admin = [protect, authorize("admin")];
+
+// Scheduled Facebook question auto-posting (admin only). The Page connection
+// (id/token/enable) lives in Settings; these routes manage the schedules.
+// Permanent Facebook publication ledger: lifetime count + reconciliation with Meta.
+router.get("/stats", ...admin, facebookStats);
+router.get("/reconcile", ...admin, reconcileFacebook);
+router.get("/schedules", ...admin, listSchedules);
+router.post("/schedules", ...admin, createSchedule);
+// One-off: re-derive the Stream › Subject › Topic breadcrumb for old My Quiz
+// schedules. Declared before "/schedules/:id" routes so it isn't shadowed.
+router.post("/schedules/backfill-labels", ...admin, backfillScheduleLabels);
+// Bulk pause / resume / delete — the ticked schedules, or ALL matching ones.
+router.post("/schedules/bulk", ...admin, bulkSchedules);
+router.get("/schedules/live", ...admin, liveScheduleProgress); // before "/schedules/:id"
+router.put("/schedules/:id", ...admin, updateSchedule);
+router.delete("/schedules/:id", ...admin, deleteSchedule);
+router.post("/schedules/:id/post-now", ...admin, postScheduleNow);
+
+// Per-question actions (from the question view): post now / schedule at a time.
+router.post("/post-question", ...admin, postQuestionNow);
+router.post("/schedule-question", ...admin, scheduleQuestion);
+router.post("/preview-image", ...admin, previewQuestionImage);
+router.get("/suggest-tags/:id", ...admin, suggestTags);
+// Build a Reel video (vertical MP4) from an uploaded image + audio track.
+router.post("/compose-reel", ...admin, composeReel);
+// AI Educational Slideshow: the allow-listed narration voices, and a test build
+// (branded slides + TTS narration → 9:16 MP4) that returns the video WITHOUT
+// publishing — used by the admin "Generate Test Slideshow" preview button.
+router.get("/tts-voices", ...admin, ttsVoices);
+router.post("/slideshow/test", ...admin, testSlideshow);
+router.get("/slideshow/test/:jobId", ...admin, testSlideshowStatus);
+
+export default router;

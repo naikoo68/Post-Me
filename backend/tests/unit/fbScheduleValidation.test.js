@@ -1,0 +1,151 @@
+import { describe, it, expect } from "vitest";
+import { pickScheduleFields, validateScheduleData } from "../../src/controllers/facebookController.js";
+
+// Helper: build sanitized data then validate in one step.
+const check = (body) => validateScheduleData(pickScheduleFields(body));
+
+describe("pickScheduleFields", () => {
+  it("defaults kind to 'question' and mode to 'recurring'", () => {
+    const d = pickScheduleFields({});
+    expect(d.kind).toBe("question");
+    expect(d.mode).toBe("recurring");
+    expect(d.runAt).toBeNull();
+  });
+
+  it("accepts kind 'custom' with text and keeps only valid http(s) media URLs", () => {
+    const d = pickScheduleFields({
+      kind: "custom",
+      customText: "  Hello world  ",
+      customMedia: ["https://res.cloudinary.com/x/a.png", "javascript:alert(1)", "", "http://ok.com/b.jpg"],
+    });
+    expect(d.kind).toBe("custom");
+    expect(d.customText).toBe("Hello world");
+    expect(d.customMedia).toEqual(["https://res.cloudinary.com/x/a.png", "http://ok.com/b.jpg"]);
+  });
+
+  it("caps custom media at 10 items", () => {
+    const many = Array.from({ length: 15 }, (_, i) => `https://c.com/${i}.png`);
+    expect(pickScheduleFields({ kind: "custom", customMedia: many }).customMedia).toHaveLength(10);
+  });
+
+  it("parses a one-off runAt only when mode is 'once'", () => {
+    const iso = "2030-01-01T09:00:00.000Z";
+    expect(pickScheduleFields({ mode: "once", runAt: iso }).runAt.toISOString()).toBe(iso);
+    // runAt ignored for recurring
+    expect(pickScheduleFields({ mode: "recurring", runAt: iso }).runAt).toBeNull();
+    // invalid runAt → null
+    expect(pickScheduleFields({ mode: "once", runAt: "not-a-date" }).runAt).toBeNull();
+  });
+
+  it("keeps only HH:MM-shaped times (max 20)", () => {
+    // Note: this mirrors the controller's format-only check (\d{1,2}:\d{2}) —
+    // it filters malformed entries, not out-of-range clock values.
+    const d = pickScheduleFields({ times: ["09:00", "bad", "9:5", "18:30"] });
+    expect(d.times).toEqual(["09:00", "18:30"]);
+  });
+});
+
+describe("validateScheduleData — question schedules", () => {
+  it("requires a source", () => {
+    expect(check({ kind: "question", times: ["09:00"] }))
+      .toMatch(/pick a source/i);
+  });
+
+  it("passes with a source and a time", () => {
+    expect(check({ kind: "question", source: { quiz: "abc" }, times: ["09:00"] })).toBe("");
+  });
+
+  it("requires at least one time when recurring", () => {
+    expect(check({ kind: "question", source: { subject: "s1" }, times: [] }))
+      .toMatch(/at least one time/i);
+  });
+});
+
+describe("validateScheduleData — custom schedules", () => {
+  it("requires text, an image, or a video", () => {
+    expect(check({ kind: "custom", times: ["09:00"] }))
+      .toMatch(/text.*image.*video/i);
+  });
+
+  it("passes with text only", () => {
+    expect(check({ kind: "custom", customText: "Announcement", times: ["09:00"] })).toBe("");
+  });
+
+  it("passes with media only (no text)", () => {
+    expect(check({ kind: "custom", customMedia: ["https://c.com/a.png"], times: ["09:00"] })).toBe("");
+  });
+
+  it("passes with a video URL only (Reel) and keeps only safe http(s) URLs", () => {
+    // A public video URL alone is enough (it becomes a Reel).
+    expect(check({ kind: "custom", customVideo: "https://cdn.com/reel.mp4", times: ["09:00"] })).toBe("");
+    // Non-http(s) / unsafe URLs are dropped, so validation still fails.
+    expect(pickScheduleFields({ kind: "custom", customVideo: "javascript:alert(1)" }).customVideo).toBe("");
+    expect(check({ kind: "custom", customVideo: "javascript:alert(1)", times: ["09:00"] }))
+      .toMatch(/text.*image.*video/i);
+  });
+
+  it("does NOT require a question source", () => {
+    // A custom post has no source; validation must not complain about it.
+    const err = check({ kind: "custom", customText: "hi", times: ["09:00"] });
+    expect(err).not.toMatch(/source/i);
+  });
+
+  it("requires runAt for a one-off custom post", () => {
+    expect(check({ kind: "custom", customText: "hi", mode: "once" }))
+      .toMatch(/date & time/i);
+  });
+
+  it("passes a one-off custom post with a valid runAt", () => {
+    expect(check({ kind: "custom", customText: "hi", mode: "once", runAt: "2030-05-01T10:00:00Z" })).toBe("");
+  });
+});
+
+
+describe("validateScheduleData — question/flashcard Reels (asReel + music library)", () => {
+  it("keeps only safe http(s) tracks in customAudios, dedupes, and caps at 20", () => {
+    const d = pickScheduleFields({
+      asReel: true,
+      customAudios: ["https://cdn.com/a.mp3", "javascript:alert(1)", "http://169.254.169.254/x.mp3", "https://cdn.com/a.mp3", "http://ok.com/b.mp3"],
+    });
+    expect(d.customAudios).toEqual(["https://cdn.com/a.mp3", "http://ok.com/b.mp3"]);
+    // The legacy single field mirrors the first track for old readers.
+    expect(d.customAudio).toBe("https://cdn.com/a.mp3");
+
+    const many = Array.from({ length: 30 }, (_, i) => `https://c.com/${i}.mp3`);
+    expect(pickScheduleFields({ customAudios: many }).customAudios).toHaveLength(20);
+  });
+
+  it("accepts a legacy single customAudio as a one-track library", () => {
+    expect(pickScheduleFields({ asReel: true, customAudio: "https://cdn.com/song.mp3" }).customAudios)
+      .toEqual(["https://cdn.com/song.mp3"]);
+  });
+
+  it("does NOT require per-schedule audio for a Reel — music comes from the shared library", () => {
+    // asReel with no per-schedule tracks is valid; the shared site library
+    // (fbReelAudios) supplies the music at post time. Validation stays pure.
+    expect(check({ kind: "question", source: { quiz: "abc" }, times: ["09:00"], asReel: true })).toBe("");
+    expect(check({ kind: "flashcard", source: { subject: "s1" }, times: ["09:00"], asReel: true })).toBe("");
+  });
+
+  it("still accepts an optional per-schedule override library", () => {
+    expect(check({ kind: "question", source: { quiz: "abc" }, times: ["09:00"], asReel: true, customAudios: ["https://cdn.com/a.mp3"] })).toBe("");
+  });
+
+  it("reads the asStory flag (also share as a 24h Story)", () => {
+    expect(pickScheduleFields({ asStory: true }).asStory).toBe(true);
+    expect(pickScheduleFields({}).asStory).toBe(false);
+  });
+
+  it("clamps reelDuration to Instagram's 3–90s Reel range and defaults it to 30", () => {
+    // Instagram's Content Publishing API rejects Reels under 3 s with a `Fatal`
+    // container status. Requests below the floor are now bumped up to 3 s so
+    // the publish never fails on duration alone.
+    expect(pickScheduleFields({}).reelDuration).toBe(30);
+    expect(pickScheduleFields({ reelDuration: 0 }).reelDuration).toBe(30); // 0 → falsy → default
+    expect(pickScheduleFields({ reelDuration: 30 }).reelDuration).toBe(30);
+    expect(pickScheduleFields({ reelDuration: 500 }).reelDuration).toBe(90);
+    expect(pickScheduleFields({ reelDuration: 1 }).reelDuration).toBe(3);
+    expect(pickScheduleFields({ reelDuration: 2 }).reelDuration).toBe(3);
+    expect(pickScheduleFields({ reelDuration: -5 }).reelDuration).toBe(3); // negative → floored to 3
+  });
+});

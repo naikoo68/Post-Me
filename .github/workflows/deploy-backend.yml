@@ -1,0 +1,105 @@
+name: Deploy Post Me backend to VM
+
+# Auto-deploys the Post Me backend to a self-hosted VM (e.g. Oracle Cloud) whenever backend
+# code lands on main. Frontend deploys are handled separately (Cloudflare), so this
+# only fires for backend changes (or a manual run). Host port 5100 → put
+# Nginx in front (api.yourdomain.com → 127.0.0.1:5100). The VM needs
+# ~/post-me/backend/postme.env (copy of backend/postme.env.example, filled in). It SSHes into the VM, pulls
+# the latest code, rebuilds the Docker image, restarts the container, and health-
+# checks it.
+#
+# Requires three repo secrets (Settings → Secrets and variables → Actions):
+#   SSH_HOST         → the VM's public IP (e.g. 129.154.254.80)
+#   SSH_USER         → ubuntu
+#   SSH_PRIVATE_KEY  → a deploy private key whose PUBLIC half is in the VM's
+#                      ~/.ssh/authorized_keys
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "backend/**"
+      - ".github/workflows/deploy-backend.yml"
+  workflow_dispatch: {}
+
+concurrency:
+  group: deploy-postme-backend
+  cancel-in-progress: false
+
+jobs:
+  deploy:
+    # Auto-deploy only once the server is set up: add the SSH_* secrets and a
+    # repository VARIABLE DEPLOY_ENABLED=true (Settings → Secrets and variables).
+    if: vars.DEPLOY_ENABLED == 'true' || github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    # contents:read lets the auto-provided GITHUB_TOKEN fetch the repo (needed
+    # now the repo is private — an unauthenticated HTTPS fetch on the VM fails
+    # with "could not read Username for 'https://github.com'").
+    permissions:
+      contents: read
+    steps:
+      - name: Deploy over SSH
+        uses: appleboy/ssh-action@v1.2.0
+        env:
+          # Encryption secret for AI provider keys at rest. Add it as a repo
+          # secret (Settings → Secrets and variables → Actions). If it's left
+          # unset, the app still runs fine with keys unencrypted (see #718).
+          AI_KEY_ENC_SECRET: ${{ secrets.AI_KEY_ENC_SECRET }}
+          # Short-lived token (auto-provided by Actions, valid only for this run)
+          # used to authenticate the git fetch on the VM. Works whether the repo
+          # is public or private, so no PAT/deploy key or VM credential is needed.
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_REPO: ${{ github.repository }}
+        with:
+          host: ${{ secrets.SSH_HOST }}
+          username: ${{ secrets.SSH_USER }}
+          key: ${{ secrets.SSH_PRIVATE_KEY }}
+          command_timeout: 20m
+          script_stop: true
+          envs: AI_KEY_ENC_SECRET,GH_TOKEN,GH_REPO
+          script: |
+            set -e
+            [ -d ~/post-me ] || git clone "https://x-access-token:${GH_TOKEN}@github.com/${GH_REPO}.git" ~/post-me
+            cd ~/post-me
+            # Fetch over an authenticated HTTPS URL rather than the VM's stored
+            # `origin` credentials. `x-access-token:<GITHUB_TOKEN>` is accepted by
+            # github.com for both public and private repos, so the deploy no
+            # longer depends on any credential being configured on the VM.
+            git fetch "https://x-access-token:${GH_TOKEN}@github.com/${GH_REPO}.git" main
+            # Hard reset to the fetched main. This updates only tracked files;
+            # the untracked backend/postme.env (your secrets) is left untouched.
+            git reset --hard FETCH_HEAD
+            cd backend
+            sudo docker build -t postme-backend .
+            sudo docker rm -f postme-backend || true
+            # Shared network with the self-hosted voice server (voice-server/,
+            # container "postme-voice") so VOICE_SERVER_URL=http://postme-voice:8000 works.
+            # Harmless when the voice server isn't installed.
+            sudo docker network create postme-net 2>/dev/null || true
+            # AI_KEY_ENC_SECRET encrypts stored YouTube tokens at rest. Only
+            # pass -e when the CI secret is actually set: a command-line -e
+            # OVERRIDES --env-file, so a missing/blank repo secret would otherwise
+            # inject an empty value, wipe the real secret from postme.env, and make
+            # EVERY saved AI key undecryptable. When it's blank we skip the -e and
+            # fall back to whatever postme.env provides.
+            if [ -n "$AI_KEY_ENC_SECRET" ]; then
+              sudo docker run -d --name postme-backend --restart always --network postme-net \
+                --env-file postme.env \
+                -e AI_KEY_ENC_SECRET="$AI_KEY_ENC_SECRET" \
+                -p 127.0.0.1:5100:5000 postme-backend
+            else
+              echo "⚠️  AI_KEY_ENC_SECRET repo secret is empty — not overriding; using the value from postme.env (if any)."
+              sudo docker run -d --name postme-backend --restart always --network postme-net \
+                --env-file postme.env \
+                -p 127.0.0.1:5100:5000 postme-backend
+            fi
+            sudo docker image prune -f
+            # Give it a moment to boot, then verify it's healthy.
+            sleep 6
+            if curl -fsS http://127.0.0.1:5100/api/health >/dev/null; then
+              echo "✅ Health check passed — deploy succeeded."
+            else
+              echo "❌ Health check FAILED after deploy."
+              sudo docker logs --tail 40 postme-backend || true
+              exit 1
+            fi

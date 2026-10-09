@@ -1,0 +1,741 @@
+// YouTube connection management (admin): status, settings, OAuth connect /
+// callback, disconnect and a connection test. Each tenant connects its OWN
+// channel — everything is saved on the caller's own Settings doc.
+import Settings from "../models/Settings.js";
+import { getOrCreateOwn } from "./settingsController.js";
+import { runUnscoped } from "../utils/tenantContext.js";
+import { clientBaseFromReq } from "../config/clientUrl.js";
+import {
+  ytClientCreds, ytRedirectUri, youtubeConfigFromSite, signYtState, verifyYtState,
+  buildYtAuthUrl, exchangeYtCode, getYtAccessToken, getYtChannel, revokeYtToken,
+  encryptYtSecret, YT_PRIVACY, isYoutubeConfigured,
+  scopesAllowPlaylists, getYtGrantedScopes, listYtPlaylists, createYtPlaylist, cleanYtPlaylistId,
+  thumbConfigFromSite, thumbnailLines, applyYtExtras, YT_THUMB_POSITIONS, YT_THUMB_FONTS, cleanThumbBox, slideTextConfigFromSite, normalizeTextBox,
+} from "../config/youtube.js";
+import { isSafePublicUrl } from "../utils/urlGuard.js";
+import { getFacebookConfig, getFacebookSiteForConfig, completeQuestionsForSource, skippedQuestionsForSource, isFacebookConfigured } from "../config/facebook.js";
+import {
+  queueFullQuizVideo, normalizeLongVideoOptions, listLongVideoJobs, getLongVideoJob, publicJob, tenantKeyNow, MAX_LONG_VIDEO_QUESTIONS, MAX_MARATHON_QUESTIONS,
+  queueLongVideoPreview, getLongVideoPreview, marathonTextPreview, publicPreviewJob, queuePublishPreview, retryLongVideoJob,
+  renderQueue, queueView, stopLongVideoJob, lanePositions,
+} from "../config/longVideo.js";
+import { activeSocialProfileId } from "../utils/socialProfile.js";
+import { designSite, seedMarathonDesign, THUMB_DESIGN_KEYS } from "../utils/marathonDesign.js";
+import { cleanCardBox } from "../utils/cardBox.js";
+import { marathonThumbnailLines } from "../utils/marathonText.js";
+import FbSchedule from "../models/FbSchedule.js";
+
+function statusOf(site, req) {
+  const { clientId, clientSecret } = ytClientCreds(site);
+  return {
+    enabled: !!site?.ytEnabled,
+    connected: !!site?.ytRefreshToken,
+    channelTitle: site?.ytChannelTitle || "",
+    channelId: site?.ytChannelId || "",
+    connectedAt: site?.ytConnectedAt || null,
+    privacy: YT_PRIVACY.includes(site?.ytPrivacy) ? site.ytPrivacy : "public",
+    clientId: site?.ytClientId || "",
+    clientSecretSet: !!site?.ytClientSecret,
+    usingEnvCredentials: !site?.ytClientId && !!process.env.YOUTUBE_CLIENT_ID,
+    credentialsReady: !!(clientId && clientSecret),
+    redirectUri: ytRedirectUri(req),
+    // Playlists ("folders") need the youtube.force-ssl permission (older
+    // connections must reconnect once). Unknown scopes → assume not granted.
+    canPlaylists: scopesAllowPlaylists(site?.ytScopes),
+    shortsPlaylist: site?.ytShortsPlaylistId ? { id: site.ytShortsPlaylistId, title: site.ytShortsPlaylistTitle || "" } : null,
+    longPlaylist: site?.ytLongPlaylistId ? { id: site.ytLongPlaylistId, title: site.ytLongPlaylistTitle || "" } : null,
+    ...designStatus(site),
+    // The Marathon tab's OWN designs (same shape) — independent of the above.
+    marathon: designStatus(designSite(site, "marathon")),
+  };
+}
+
+// The long-video designs of one site view (full quiz, or designSite(…, "marathon")).
+function designStatus(site) {
+  return {
+    thumb: thumbConfigFromSite(site),
+    // Text box + styling for the intro / end / Short-end slides (like the thumbnail).
+    introText: slideTextConfigFromSite(site, "intro"),
+    outroText: slideTextConfigFromSite(site, "outro"),
+    shortOutroText: slideTextConfigFromSite(site, "shortoutro"),
+    shortIntroText: slideTextConfigFromSite(site, "shortintro"),
+    // 16:9 question / answer templates + card position.
+    questionTemplateUrl: site?.longVideoQuestionTemplateUrl || "",
+    answerTemplateUrl: site?.longVideoAnswerTemplateUrl || "",
+    cardBox: site?.longVideoCardBox || null,
+    // Saved long-video form settings (null = never saved → the form uses the AI Slideshow ones).
+    longVideoDefaults: site?.longVideoDefaults || null,
+  };
+}
+
+const hexColor = (v, d) => (/^#[0-9a-f]{6}$/i.test(String(v || "").trim()) ? String(v).trim().toLowerCase() : d);
+// { id, title } | null → the playlist fields to store.
+function playlistFields(v) {
+  const id = cleanYtPlaylistId(v?.id);
+  return { id, title: id ? String(v?.title || "").replace(/[<>]/g, "").trim().slice(0, 150) : "" };
+}
+// Apply thumbnail-template fields from a request body onto an object (the
+// Settings doc when saving, or a plain copy for a live preview).
+function applyThumbFields(target, b) {
+  if ("thumbTemplateUrl" in b) {
+    const u = String(b.thumbTemplateUrl || "").trim();
+    target.ytThumbTemplateUrl = u && /^https?:\/\//i.test(u) && isSafePublicUrl(u) ? u.slice(0, 1000) : "";
+  }
+  if ("thumbEnabled" in b) target.ytThumbEnabled = !!b.thumbEnabled;
+  if ("thumbShowText" in b) target.ytThumbShowText = !!b.thumbShowText;
+  if ("thumbShowStream" in b) target.ytThumbShowStream = !!b.thumbShowStream;
+  if ("thumbShowSubject" in b) target.ytThumbShowSubject = !!b.thumbShowSubject;
+  if ("thumbPosition" in b) target.ytThumbTextPosition = YT_THUMB_POSITIONS.includes(b.thumbPosition) ? b.thumbPosition : "left";
+  if ("thumbTextColor" in b) target.ytThumbTextColor = hexColor(b.thumbTextColor, "#ffffff");
+  if ("thumbAccentColor" in b) target.ytThumbAccentColor = hexColor(b.thumbAccentColor, "#facc15");
+  // Text box (where the subject/topic/quiz fill the template's empty area).
+  if ("thumbBox" in b) target.ytThumbBox = cleanThumbBox(b.thumbBox);
+  if ("thumbAlign" in b) target.ytThumbAlign = ["left", "center", "right"].includes(b.thumbAlign) ? b.thumbAlign : "left";
+  if ("thumbVAlign" in b) target.ytThumbVAlign = ["top", "center", "bottom"].includes(b.thumbVAlign) ? b.thumbVAlign : "center";
+  if ("thumbFont" in b) target.ytThumbFont = YT_THUMB_FONTS.includes(b.thumbFont) ? b.thumbFont : "sans";
+  if ("thumbUppercase" in b) target.ytThumbUppercase = !!b.thumbUppercase;
+  if ("thumbKickerColor" in b) target.ytThumbKickerColor = b.thumbKickerColor ? hexColor(b.thumbKickerColor, "") : "";
+  if ("thumbBadgeTextColor" in b) target.ytThumbBadgeTextColor = hexColor(b.thumbBadgeTextColor, "#111111");
+  if ("thumbStrokeColor" in b) target.ytThumbStrokeColor = hexColor(b.thumbStrokeColor, "#000000");
+  if ("thumbStrokeWidth" in b) target.ytThumbStrokeWidth = clampInt(b.thumbStrokeWidth, 3, 0, 16);
+  if ("thumbShadow" in b) target.ytThumbShadow = !!b.thumbShadow;
+  if ("thumbPanelColor" in b) target.ytThumbPanelColor = b.thumbPanelColor ? hexColor(b.thumbPanelColor, "") : "";
+  if ("thumbPanelOpacity" in b) target.ytThumbPanelOpacity = clampInt(b.thumbPanelOpacity, 0, 0, 100);
+  if ("thumbPanelRadius" in b) target.ytThumbPanelRadius = clampInt(b.thumbPanelRadius, 24, 0, 80);
+  if ("thumbHeadlineSize" in b) target.ytThumbHeadlineSize = clampInt(b.thumbHeadlineSize, 104, 24, 200);
+  if ("thumbKickerSize" in b) target.ytThumbKickerSize = clampInt(b.thumbKickerSize, 44, 12, 120);
+  if ("thumbBadgeSize" in b) target.ytThumbBadgeSize = clampInt(b.thumbBadgeSize, 46, 12, 120);
+  if ("thumbLineHeight" in b) { const n = Number(b.thumbLineHeight); target.ytThumbLineHeight = Number.isFinite(n) ? Math.max(0.8, Math.min(2, n)) : 1.05; }
+  if ("thumbRotate" in b) target.ytThumbRotate = clampInt(b.thumbRotate, 0, -180, 180);
+}
+const clampInt = (v, d, lo, hi) => { const n = Math.round(Number(v)); return Number.isFinite(n) ? Math.max(lo, Math.min(hi, n)) : d; };
+
+// GET /api/youtube/status
+export async function youtubeStatus(req, res) {
+  const site = await getOrCreateOwn();
+  // First visit: give the Marathon tab its own copy of the designs, so from
+  // now on editing one tab never changes the other.
+  if (seedMarathonDesign(site)) await site.save().catch(() => {});
+  res.json(statusOf(site, req));
+}
+
+// PUT /api/youtube/settings — { enabled?, privacy?, clientId?, clientSecret?,
+//   shortsPlaylist?:{id,title}|null, longPlaylist?:{id,title}|null,
+//   thumbTemplateUrl?, thumbEnabled?, thumbShowText?, thumbPosition?, thumbTextColor?, thumbAccentColor? }
+// A blank clientSecret keeps the saved one (same pattern as the FB token).
+export async function saveYoutubeSettings(req, res) {
+  const site = await getOrCreateOwn();
+  const b = req.body || {};
+  if ("enabled" in b) site.ytEnabled = !!b.enabled;
+  if ("privacy" in b) site.ytPrivacy = YT_PRIVACY.includes(b.privacy) ? b.privacy : "public";
+  if ("clientId" in b) {
+    const id = String(b.clientId || "").trim().slice(0, 200);
+    if (id && id !== site.ytClientId && site.ytRefreshToken) {
+      // A different OAuth app can't use the old refresh token.
+      site.ytRefreshToken = ""; site.ytChannelId = ""; site.ytChannelTitle = ""; site.ytConnectedAt = null;
+    }
+    site.ytClientId = id;
+  }
+  if ("clientSecret" in b) {
+    const sec = String(b.clientSecret || "").trim();
+    if (sec) site.ytClientSecret = encryptYtSecret(sec.slice(0, 200));
+  }
+  if ("shortsPlaylist" in b) { const p = playlistFields(b.shortsPlaylist); site.ytShortsPlaylistId = p.id; site.ytShortsPlaylistTitle = p.title; }
+  if ("longPlaylist" in b) { const p = playlistFields(b.longPlaylist); site.ytLongPlaylistId = p.id; site.ytLongPlaylistTitle = p.title; }
+  // design:"marathon" → the Marathon tab's OWN designs (site.marathonDesign);
+  // otherwise the full-quiz ones. Seed first, so the other side keeps its values.
+  seedMarathonDesign(site);
+  const marathon = b.design === "marathon";
+  const target = marathon ? { ...site.marathonDesign } : site;
+  applyThumbFields(target, b);
+  // Intro / end / Short-end slide text boxes (Mixed) — same shape as the thumbnail.
+  for (const k of ["longVideoIntroText", "longVideoOutroText", "longVideoShortOutroText", "longVideoShortIntroText"]) {
+    if (k in b) {
+      target[k] = b[k] && typeof b[k] === "object" ? normalizeTextBox(b[k]) : null;
+      if (!marathon) site.markModified(k);
+    }
+  }
+  // Slide template backgrounds — only safe public http(s) image URLs; "" clears.
+  for (const k of ["longVideoIntroTemplateUrl", "longVideoOutroTemplateUrl", "longVideoShortOutroTemplateUrl", "longVideoShortIntroTemplateUrl", "longVideoQuestionTemplateUrl", "longVideoAnswerTemplateUrl"]) {
+    if (k in b) {
+      const u = String(b[k] || "").trim();
+      target[k] = u && /^https?:\/\//i.test(u) && isSafePublicUrl(u) ? u : "";
+    }
+  }
+  // 16:9 card position (the full-quiz one is also saved via Settings).
+  if ("longVideoCardBox" in b) { target.longVideoCardBox = cleanCardBox(b.longVideoCardBox); if (!marathon) site.markModified("longVideoCardBox"); }
+  if (marathon) { site.marathonDesign = target; site.markModified("marathonDesign"); }
+  await site.save();
+  res.json(statusOf(site, req));
+}
+
+// The page the channel OWNER sees after a "Send link" connection. They aren't
+// logged in to our admin panel, so redirecting them there would just show a
+// login screen — show a plain result page instead. All text is escaped.
+const escHtml = (s) => String(s ?? "").replace(/[&<>"']/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
+function remoteResultPage(res, { ok, text }) {
+  res.set("Cache-Control", "no-store");
+  res.set("Content-Security-Policy", "default-src 'none'; style-src 'unsafe-inline'");
+  return res.status(ok ? 200 : 400).type("html").send(`<!doctype html><html><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1"><title>YouTube ${ok ? "connected" : "not connected"}</title>
+<style>body{font-family:system-ui,sans-serif;background:#f8fafc;margin:0;display:flex;min-height:100vh;align-items:center;justify-content:center;padding:16px}
+.c{background:#fff;border:1px solid #e2e8f0;border-radius:16px;padding:28px;max-width:420px;text-align:center;box-shadow:0 4px 20px #0001}
+h1{font-size:20px;margin:8px 0;color:${ok ? "#059669" : "#e11d48"}}p{color:#475569;line-height:1.5}</style></head>
+<body><div class="c"><div style="font-size:44px">${ok ? "✅" : "⚠️"}</div><h1>${ok ? "YouTube connected" : "Could not connect"}</h1>
+<p>${escHtml(text)}</p><p style="font-size:13px;color:#94a3b8">You can close this page now.</p></div></body></html>`);
+}
+
+// POST /api/youtube/connect { remote? } → { url, expiresAt, remote } — "here"
+// mode: this browser navigates to the URL. remote:true ("Send link" mode): the
+// admin shares the URL with the channel owner, who approves on their own device;
+// the signed state still pins THIS settings doc, so their channel lands on the
+// right (cross-posting) profile.
+export async function youtubeConnect(req, res) {
+  const site = await getOrCreateOwn();
+  const { clientId, clientSecret } = ytClientCreds(site);
+  if (!clientId || !clientSecret) {
+    return res.status(400).json({ message: "Add your Google OAuth Client ID and Client secret first (see the setup steps)." });
+  }
+  const redirectUri = ytRedirectUri(req);
+  // A cross-posting user's own YouTube → back to that user's page.
+  const returnTo = `${clientBaseFromReq(req)}${req.socialProfileId ? `/admin/cross-posting/${req.socialProfileId}` : "/admin/facebook"}`;
+  const remote = req.body?.remote === true;
+  const ttlMs = 15 * 60 * 1000;
+  let state;
+  try {
+    state = signYtState({ sid: String(site._id), ru: redirectUri, rt: returnTo, uid: req.user?._id ? String(req.user._id) : "", ...(remote ? { rm: 1 } : {}) }, ttlMs);
+  } catch (e) {
+    return res.status(500).json({ message: e.message });
+  }
+  res.set("Cache-Control", "no-store");
+  res.json({ url: buildYtAuthUrl({ clientId, redirectUri, state }), redirectUri, remote, expiresAt: new Date(Date.now() + ttlMs).toISOString() });
+}
+
+// GET /api/youtube/oauth/callback?code&state — PUBLIC (Google redirects here).
+// Security comes from the HMAC-signed, short-lived `state`, which pins the exact
+// Settings doc (tenant) the admin started from.
+export async function youtubeCallback(req, res) {
+  const data = verifyYtState(req.query.state);
+  const back = (params) => {
+    // "Send link" mode: the channel owner isn't an admin — show a result page.
+    if (data?.rm) {
+      return remoteResultPage(res, params.youtube === "connected"
+        ? { ok: true, text: `Your channel “${params.channel || "YouTube"}” is now connected. Thank you!` }
+        : { ok: false, text: params.reason || "Could not connect YouTube." });
+    }
+    const fallback = `${String(process.env.CLIENT_URL || "http://localhost:5173").replace(/\/$/, "")}/admin/facebook`;
+    let u;
+    try { u = new URL(data?.rt || fallback); } catch { u = new URL("http://localhost:5173/admin/facebook"); }
+    for (const [k, v] of Object.entries(params)) u.searchParams.set(k, v);
+    return res.redirect(u.toString());
+  };
+  if (!data) return back({ youtube: "error", reason: "The connection link expired or was invalid — please try again." });
+  if (req.query.error) return back({ youtube: "error", reason: req.query.error === "access_denied" ? "You cancelled the Google permission screen." : String(req.query.error) });
+  const code = String(req.query.code || "");
+  if (!code) return back({ youtube: "error", reason: "Google did not return an authorisation code." });
+
+  try {
+    const site = await runUnscoped(() => Settings.findById(data.sid));
+    if (!site) return back({ youtube: "error", reason: "Settings not found." });
+    const { clientId, clientSecret } = ytClientCreds(site);
+    const { refreshToken, accessToken, scope } = await exchangeYtCode({ code, clientId, clientSecret, redirectUri: data.ru });
+    if (!refreshToken) return back({ youtube: "error", reason: "Google did not return a refresh token. Remove the app's access at myaccount.google.com/permissions and connect again." });
+    let channel = null;
+    try { channel = await getYtChannel(accessToken); } catch { /* channel name is cosmetic */ }
+    if (!channel) return back({ youtube: "error", reason: "This Google account has no YouTube channel. Create one on YouTube, then connect again." });
+    await runUnscoped(() => Settings.updateOne({ _id: site._id }, {
+      $set: {
+        ytRefreshToken: encryptYtSecret(refreshToken),
+        ytChannelId: channel.id,
+        ytChannelTitle: channel.title,
+        ytConnectedAt: new Date(),
+        ytEnabled: true,
+        ytScopes: scope,
+        // A different channel → its playlists don't apply any more.
+        ...(site.ytChannelId && site.ytChannelId !== channel.id
+          ? { ytShortsPlaylistId: "", ytShortsPlaylistTitle: "", ytLongPlaylistId: "", ytLongPlaylistTitle: "" }
+          : {}),
+      },
+    }));
+    return back({ youtube: "connected", ...(data.rm ? { channel: channel.title } : {}) });
+  } catch (e) {
+    return back({ youtube: "error", reason: String(e?.message || "Could not connect YouTube.").slice(0, 200) });
+  }
+}
+
+// POST /api/youtube/disconnect
+export async function youtubeDisconnect(req, res) {
+  const site = await getOrCreateOwn();
+  const cfg = youtubeConfigFromSite(site);
+  await revokeYtToken(cfg.ytRefreshToken);
+  site.ytRefreshToken = ""; site.ytChannelId = ""; site.ytChannelTitle = ""; site.ytConnectedAt = null; site.ytEnabled = false;
+  site.ytScopes = "";
+  await site.save();
+  res.json(statusOf(site, req));
+}
+
+// ---- Long videos ----
+const oid = (v) => (/^[a-f0-9]{24}$/i.test(String(v || "").trim()) ? String(v).trim() : null);
+const cleanPublishAt = (v) => {
+  if (!v) return null;
+  const d = new Date(v);
+  return isNaN(d.getTime()) || d.getTime() < Date.now() + 5 * 60 * 1000 ? null : d.toISOString();
+};
+
+// POST /api/youtube/long-video — make ONE 16:9 video of every question in a
+// source and upload it. Body: { source:{subject,session,quiz,testSeries,label},
+// title?, privacy?, publishAt?, hashtags? } → { job } (poll GET …/:id).
+export async function startLongVideo(req, res) {
+  const b = req.body || {};
+  const src = b.source || {};
+  const source = {
+    subject: oid(src.subject), session: oid(src.session), quiz: oid(src.quiz), testSeries: oid(src.testSeries), topic: oid(src.topic), practiceTopic: oid(src.practiceTopic),
+    label: String(src.label || "").trim().slice(0, 300),
+  };
+  if (!source.subject && !source.session && !source.quiz && !source.testSeries && !source.topic && !source.practiceTopic) {
+    return res.status(400).json({ message: "Pick the content (a subject, topic session, quiz or My Quiz) first." });
+  }
+  // A publish time that was sent but can't be used is an error — never
+  // silently publish right away instead of at the chosen time.
+  if (b.publishAt && !cleanPublishAt(b.publishAt)) {
+    return res.status(400).json({ message: "The scheduled time must be a valid date at least 5 minutes from now." });
+  }
+  const cfg = await getFacebookConfig();
+  const site = await getFacebookSiteForConfig(cfg);
+  try {
+    const job = queueFullQuizVideo({
+      source, cfg, site,
+      titleTemplate: String(b.title || "").replace(/[<>]/g, "").trim().slice(0, 100),
+      privacy: YT_PRIVACY.includes(b.privacy) ? b.privacy : cfg.ytPrivacy,
+      publishAt: cleanPublishAt(b.publishAt),
+      hashtags: String(b.hashtags || "").trim().slice(0, 1000),
+      // Playlist: absent → the default long-video playlist; {id:""} → none.
+      ...("playlist" in b ? { playlist: playlistFields(b.playlist).id ? playlistFields(b.playlist) : null } : {}),
+      useThumbnail: b.useThumbnail !== false,
+      // How many questions, narration / slides and where to post (blank = saved defaults).
+      options: b.options && typeof b.options === "object" ? b.options : {},
+    });
+    res.status(202).json({ job });
+  } catch (e) {
+    res.status(400).json({ message: e.message });
+  }
+}
+
+// POST /api/youtube/long-video/preview { source, title?, useThumbnail?, options }
+// → { job } — makes the FULL video (all chosen questions, intro + end slides),
+// the Short teaser and the thumbnail exactly as a real run would, but posts
+// nothing. Poll GET …/preview/:id.
+export async function startLongVideoPreview(req, res) {
+  const b = req.body || {};
+  const src = b.source || {};
+  const source = {
+    subject: oid(src.subject), session: oid(src.session), quiz: oid(src.quiz), testSeries: oid(src.testSeries), topic: oid(src.topic), practiceTopic: oid(src.practiceTopic),
+    label: String(src.label || "").trim().slice(0, 300),
+  };
+  if (!source.subject && !source.session && !source.quiz && !source.testSeries && !source.topic && !source.practiceTopic) {
+    return res.status(400).json({ message: "Pick the content (a subject, topic session, quiz or My Quiz) first." });
+  }
+  const cfg = await getFacebookConfig();
+  const site = await getFacebookSiteForConfig(cfg);
+  try {
+    const job = queueLongVideoPreview({
+      source, cfg, site,
+      titleTemplate: String(b.title || "").replace(/[<>]/g, "").trim().slice(0, 100),
+      hashtags: String(b.hashtags || "").slice(0, 2000),
+      useThumbnail: b.useThumbnail !== false,
+      options: b.options && typeof b.options === "object" ? b.options : {},
+      ownerId: req.user?._id,
+    });
+    res.status(202).json({ job });
+  } catch (e) {
+    res.status(400).json({ message: e.message });
+  }
+}
+
+// POST /api/youtube/long-video/marathon-text-preview { source:{topic|session|practiceTopic}, title?, hashtags?, useThumbnail?, options? }
+// → { preview:{ title, total, quizzes, tags, description, thumbnail, intro, shortIntro, notes } }
+// Instant (no video is made): the words a marathon will be posted with.
+export async function longVideoMarathonTextPreview(req, res) {
+  const b = req.body || {};
+  const src = b.source || {};
+  const source = { topic: oid(src.topic), session: oid(src.session), practiceTopic: oid(src.practiceTopic), label: String(src.label || "").trim().slice(0, 300) };
+  if (!source.topic && !source.session && !source.practiceTopic) return res.status(400).json({ message: "Pick a whole topic first." });
+  const cfg = await getFacebookConfig();
+  const site = await getFacebookSiteForConfig(cfg);
+  try {
+    const preview = await marathonTextPreview({
+      source, cfg, site,
+      titleTemplate: String(b.title || "").replace(/[<>]/g, "").trim().slice(0, 100),
+      hashtags: String(b.hashtags || "").slice(0, 2000),
+      useThumbnail: b.useThumbnail !== false,
+      options: b.options && typeof b.options === "object" ? b.options : {},
+    });
+    res.set("Cache-Control", "no-store");
+    res.json({ preview });
+  } catch (e) {
+    res.status(400).json({ message: e.message });
+  }
+}
+
+// GET /api/youtube/long-video/preview/:id → { job }
+export function longVideoPreviewStatus(req, res) {
+  const j = getLongVideoPreview(req.params.id, tenantKeyNow(), req.user?._id);
+  if (!j) return res.status(404).json({ message: "Preview not found (it may have expired or the server restarted) — try again." });
+  res.set("Cache-Control", "no-store");
+  res.json({ job: publicPreviewJob(j) });
+}
+
+// POST /api/youtube/long-video/preview/:id/publish
+// { privacy?, publishAt?, hashtags?, playlist?, options:{ toYoutube, toFacebook, asShort } }
+// → { job } — posts the EXACT previewed files (no re-render). Poll the list.
+export async function publishLongVideoPreview(req, res) {
+  const preview = getLongVideoPreview(req.params.id, tenantKeyNow(), req.user?._id);
+  if (!preview) return res.status(404).json({ message: "Preview not found (it may have expired or the server restarted) — make the preview again." });
+  const b = req.body || {};
+  if (b.publishAt && !cleanPublishAt(b.publishAt)) {
+    return res.status(400).json({ message: "The scheduled time must be a valid date at least 5 minutes from now." });
+  }
+  const cfg = await getFacebookConfig();
+  const site = await getFacebookSiteForConfig(cfg);
+  try {
+    const job = queuePublishPreview({
+      preview, cfg, site,
+      privacy: YT_PRIVACY.includes(b.privacy) ? b.privacy : cfg.ytPrivacy,
+      publishAt: cleanPublishAt(b.publishAt),
+      hashtags: String(b.hashtags || "").trim().slice(0, 1000),
+      ...("playlist" in b ? { playlist: playlistFields(b.playlist).id ? playlistFields(b.playlist) : null } : {}),
+      options: b.options && typeof b.options === "object" ? b.options : {},
+    });
+    res.status(202).json({ job });
+  } catch (e) {
+    res.status(400).json({ message: e.message });
+  }
+}
+
+// POST /api/youtube/long-video/topic-quizzes { source:{topic|session|practiceTopic}, per? }
+// → { quizzes:[{ id, name, questions, videos }] } — the topic's quizzes in order
+// (for "Quiz by quiz": pick where to start). videos = parts at `per` per video.
+export async function longVideoTopicQuizzes(req, res) {
+  const src = req.body?.source || {};
+  const source = { topic: oid(src.topic), session: oid(src.session), practiceTopic: oid(src.practiceTopic) };
+  if (!source.topic && !source.session && !source.practiceTopic) return res.json({ quizzes: [] });
+  const per = Math.max(1, Math.min(MAX_LONG_VIDEO_QUESTIONS, Number(req.body?.per) || MAX_LONG_VIDEO_QUESTIONS));
+  const { topicQuizList } = await import("../config/longVideo.js");
+  const list = await topicQuizList(source).catch(() => []);
+  const quizzes = [];
+  for (const q of list.slice(0, 300)) {
+    const n = (await completeQuestionsForSource({ [q.kind]: q.id }).catch(() => [])).length;
+    // Questions a video would skip (incomplete / unpublished), with the reason.
+    const skipped = await skippedQuestionsForSource({ [q.kind]: q.id }).catch(() => []);
+    quizzes.push({ id: q.id, name: q.name, questions: n, videos: n ? Math.ceil(n / per) : 0, skipped: skipped.slice(0, 10), skippedCount: skipped.length });
+  }
+  res.json({ quizzes });
+}
+
+// POST /api/youtube/long-video/count { source } → { total, max, facebookReady, youtubeReady }
+// How many complete questions the picked content has (for "how many questions").
+export async function longVideoQuestionCount(req, res) {
+  const src = req.body?.source || {};
+  const source = { subject: oid(src.subject), session: oid(src.session), quiz: oid(src.quiz), testSeries: oid(src.testSeries), topic: oid(src.topic), practiceTopic: oid(src.practiceTopic) };
+  const cfg = await getFacebookConfig();
+  const ready = { max: MAX_LONG_VIDEO_QUESTIONS, marathonMax: MAX_MARATHON_QUESTIONS, youtubeReady: isYoutubeConfigured(cfg), facebookReady: isFacebookConfigured(cfg) };
+  if (!source.subject && !source.session && !source.quiz && !source.testSeries && !source.topic && !source.practiceTopic) return res.json({ total: 0, ...ready });
+  const all = await completeQuestionsForSource(source).catch(() => []);
+  res.json({ total: all.length, ...ready });
+}
+
+// PUT /api/youtube/long-video/defaults { options } → status. "Save settings
+// only": the long-video form opens with these next time.
+export async function saveLongVideoDefaults(req, res) {
+  const site = await getOrCreateOwn();
+  const o = normalizeLongVideoOptions(req.body?.options || {}, site);
+  delete o.start; delete o.part;
+  // The Marathon tab keeps its own saved settings.
+  seedMarathonDesign(site);
+  if (req.body?.design === "marathon") {
+    delete o.marathon;
+    site.marathonDesign = { ...site.marathonDesign, longVideoDefaults: o };
+    site.markModified?.("marathonDesign");
+  } else {
+    site.longVideoDefaults = o;
+    site.markModified?.("longVideoDefaults");
+  }
+  await site.save();
+  res.json(statusOf(site, req));
+}
+
+// GET /api/youtube/long-video — recent long-video jobs (this institute).
+export async function listLongVideos(req, res) {
+  const cfg = await getFacebookConfig();
+  res.json({ jobs: await listLongVideoJobs(tenantKeyNow()), maxQuestions: MAX_LONG_VIDEO_QUESTIONS, marathonMax: MAX_MARATHON_QUESTIONS, youtubeReady: isYoutubeConfigured(cfg), facebookReady: isFacebookConfigured(cfg) });
+}
+
+// POST /api/youtube/long-video/:id/retry → { job } — make a failed video again
+// with the same settings (e.g. one stopped by a server restart).
+export async function retryLongVideo(req, res) {
+  const cfg = await getFacebookConfig();
+  const site = await getFacebookSiteForConfig(cfg);
+  try {
+    const job = await retryLongVideoJob(req.params.id, tenantKeyNow(), { cfg, site });
+    res.status(202).json({ job });
+  } catch (e) {
+    res.status(400).json({ message: e.message });
+  }
+}
+
+// Which queued / rendering videos this admin may see in full and stop: their
+// own institute's (same tenant key), or one made by a schedule they can see.
+// The scheduler stamps its jobs with the schedule's tenant id, which can differ
+// from the admin request's, so a schedule-visibility check covers those. The
+// FbSchedule query is tenant-scoped by the model plugin.
+async function ownJobsFilter(list) {
+  const mine = tenantKeyNow();
+  // Your own Social Media Auto Posting and each cross-posting user are
+  // separate accounts: each sees and stops only its OWN videos.
+  const pid = activeSocialProfileId();
+  list = list.filter((j) => String(j.profileId || "") === pid);
+  const schIds = [...new Set(list.filter((j) => j.scheduleId && j.tenantKey !== mine).map((j) => j.scheduleId))];
+  const visible = new Set();
+  if (schIds.length) {
+    const rows = await FbSchedule.find({ _id: { $in: schIds } }).select("_id").lean().catch(() => []);
+    for (const r of rows) visible.add(String(r._id));
+  }
+  return (j) => String(j.profileId || "") === pid && (j.tenantKey === mine || (!!j.scheduleId && visible.has(String(j.scheduleId))));
+}
+
+// GET /api/youtube/long-video/queue → { queue: [...], parallel } — THIS
+// account's videos only: the one being made now and the ones waiting behind
+// it, in order. Other accounts (cross-posting users, other institutes) render
+// in their own lanes and never appear here.
+export async function longVideoQueue(_req, res) {
+  const isMine = await ownJobsFilter(renderQueue());
+  const list = renderQueue().filter(isMine);
+  const pos = lanePositions(list);
+  res.json({ queue: list.map((j) => ({ ...queueView(j, pos.get(j.id) || 0), mine: true })) });
+}
+
+// POST /api/youtube/long-video/:id/stop { pauseSchedule? } — stop a queued or
+// rendering video (nothing is posted). Optionally also pause its schedule so
+// it doesn't simply make the video again at the next time.
+export async function stopLongVideo(req, res) {
+  const id = String(req.params.id || "");
+  const j = renderQueue().find((x) => x.id === id);
+  if (!j || !(await ownJobsFilter([j]))(j)) return res.status(404).json({ message: "That video is no longer in the queue." });
+  try {
+    stopLongVideoJob(id);
+  } catch (e) {
+    return res.status(e.status || 400).json({ message: e.message });
+  }
+  let paused = false;
+  if (req.body?.pauseSchedule && j.scheduleId) {
+    const r = await FbSchedule.updateOne({ _id: j.scheduleId }, { $set: { enabled: false } }).catch(() => null);
+    paused = !!(r?.modifiedCount || r?.matchedCount);
+  }
+  res.json({ ok: true, job: queueView(j), paused });
+}
+
+// GET /api/youtube/long-video/:id
+export async function longVideoStatus(req, res) {
+  const j = getLongVideoJob(req.params.id, tenantKeyNow());
+  if (!j) return res.status(404).json({ message: "Job not found (it may have expired or the server restarted)." });
+  res.json({ job: publicJob(j) });
+}
+
+// POST /api/youtube/upload-token — a SHORT-LIVED (≤1 h) access token so the
+// admin's browser can upload a big video file STRAIGHT to YouTube (the file
+// never passes through our server — no size limit here). Admin only; the
+// long-lived refresh token never leaves the server.
+export async function youtubeUploadToken(req, res) {
+  const site = await getOrCreateOwn();
+  const cfg = youtubeConfigFromSite(site);
+  if (!cfg.ytRefreshToken || !cfg.ytEnabled) return res.status(400).json({ message: "Connect YouTube (and switch uploads on) first." });
+  try {
+    const accessToken = await getYtAccessToken(cfg);
+    res.set("Cache-Control", "no-store");
+    res.json({ accessToken, privacy: cfg.ytPrivacy, channelTitle: site.ytChannelTitle || "" });
+  } catch (e) {
+    res.status(400).json({ message: e.message || "Could not get a YouTube upload token." });
+  }
+}
+
+// POST /api/youtube/test — checks the saved connection works (no upload).
+export async function youtubeTest(req, res) {
+  const site = await getOrCreateOwn();
+  const cfg = youtubeConfigFromSite(site);
+  if (!cfg.ytRefreshToken) return res.status(400).json({ message: "YouTube is not connected yet." });
+  try {
+    const token = await getYtAccessToken(cfg);
+    const ch = await getYtChannel(token);
+    if (!ch) return res.status(400).json({ message: "Connected Google account has no YouTube channel." });
+    const scopes = await getYtGrantedScopes(cfg).catch(() => "");
+    if (ch.title !== site.ytChannelTitle || ch.id !== site.ytChannelId || (scopes && scopes !== site.ytScopes)) {
+      site.ytChannelTitle = ch.title; site.ytChannelId = ch.id;
+      if (scopes) site.ytScopes = scopes;
+      await site.save();
+    }
+    res.json({ ok: true, channelTitle: ch.title, channelId: ch.id });
+  } catch (e) {
+    res.status(400).json({ message: e.message || "YouTube connection test failed." });
+  }
+}
+
+// ---- Playlists ("folders") ----
+
+// GET /api/youtube/playlists → { playlists:[{id,title,privacy,count}], canCreate }
+export async function youtubePlaylists(req, res) {
+  const site = await getOrCreateOwn();
+  const cfg = youtubeConfigFromSite(site);
+  if (!cfg.ytRefreshToken) return res.status(400).json({ message: "Connect YouTube first." });
+  try {
+    res.json({ playlists: await listYtPlaylists(cfg), canCreate: scopesAllowPlaylists(site.ytScopes) });
+  } catch (e) {
+    res.status(400).json({ message: e.message || "Could not load your playlists." });
+  }
+}
+
+// POST /api/youtube/playlists { title, privacy? } → { playlist }
+export async function youtubeCreatePlaylist(req, res) {
+  const site = await getOrCreateOwn();
+  const cfg = youtubeConfigFromSite(site);
+  if (!cfg.ytRefreshToken) return res.status(400).json({ message: "Connect YouTube first." });
+  try {
+    const b = req.body || {};
+    const playlist = await createYtPlaylist({ title: b.title, privacy: YT_PRIVACY.includes(b.privacy) ? b.privacy : "public" }, cfg);
+    // It worked, so this connection has the playlist permission.
+    if (!scopesAllowPlaylists(site.ytScopes)) {
+      site.ytScopes = `${site.ytScopes || ""} https://www.googleapis.com/auth/youtube.force-ssl`.trim();
+      await site.save();
+    }
+    res.status(201).json({ playlist });
+  } catch (e) {
+    res.status(400).json({ message: e.message || "Could not create the playlist." });
+  }
+}
+
+// ---- Thumbnail template ----
+
+// POST /api/youtube/thumbnail-preview { title?|subject?,topic?,count?, …unsaved thumb fields }
+// → { image: "data:image/jpeg;base64,…" }. Uses the saved template, overridden by any fields in the body
+// so the admin sees changes before saving.
+export async function youtubeThumbnailPreview(req, res) {
+  const b = req.body || {};
+  const site = designSite(await getOrCreateOwn(), b.design);
+  // Seed from ALL saved thumbnail fields, then apply the unsaved edits in `b`,
+  // so the preview matches what a real video would draw.
+  const draft = Object.fromEntries(THUMB_DESIGN_KEYS.map((k) => [k, site[k]]));
+  draft.ytThumbEnabled = true;
+  applyThumbFields(draft, { ...b, thumbEnabled: true });
+  const thumb = thumbConfigFromSite(draft);
+  if (!thumb.templateUrl) return res.status(400).json({ message: "Upload a thumbnail template first." });
+  // Sample text for the preview — each real video fills in its own names.
+  // Marathon thumbnails read "Top N Questions of <Topic>" + "Marathon Quiz".
+  // "Make my own thumbnail": the admin's OWN three lines (any of them may be empty).
+  const own = b.customLines && typeof b.customLines === "object" ? b.customLines : null;
+  const ownLine = (k, max) => String(own?.[k] ?? "").replace(/[<>]/g, "").replace(/\s+/g, " ").trim().slice(0, max);
+  const lines = own ? { kicker: ownLine("kicker", 60), headline: ownLine("headline", 80), badge: ownLine("badge", 40) } : b.design === "marathon" ? marathonThumbnailLines({ stream: "Stream Name", subject: "Subject Name", topic: "Topic Name", total: 1000, showStream: thumb.showStream, showSubject: thumb.showSubject }) : thumbnailLines({
+    stream: String(b.stream ?? "Stream Name").slice(0, 100),
+    subject: String(b.subject ?? "Subject Name").slice(0, 100),
+    topic: String(b.topic ?? "Topic Name").slice(0, 100),
+    quiz: String(b.quiz ?? "Quiz 1").slice(0, 100),
+    count: Number(b.count ?? 25) || 0,
+    title: String(b.title || "").slice(0, 100),
+  });
+  const { renderYoutubeThumbnail } = await import("../config/ytThumbnail.js");
+  const r = await renderYoutubeThumbnail({ ...thumb, lines, brandColor: site.brandColor || site.primaryColor });
+  if (!r.image) return res.status(400).json({ message: r.error || "Could not draw the thumbnail." });
+  res.set("Cache-Control", "no-store");
+  res.json({ image: `data:${r.mime};base64,${r.image.toString("base64")}`, bytes: r.image.length });
+}
+
+// POST /api/youtube/slide-text-preview { role, config } → { image } — a preview
+// of an intro / end / Short-end slide with its text box + styling and sample text.
+export async function youtubeSlideTextPreview(req, res) {
+  const marathon = req.body?.design === "marathon";
+  const site = designSite(await getOrCreateOwn(), req.body?.design);
+  const role = ["intro", "outro", "shortintro", "shortoutro"].includes(req.body?.role) ? req.body.role : "intro";
+  const vertical = role === "shortintro" || role === "shortoutro"; // the Short's slides are 9:16
+  const saved = slideTextConfigFromSite(site, role) || {};
+  const cfg = { ...saved, ...normalizeTextBox({ ...saved, ...(req.body?.config || {}) }) };
+  const templateUrl = String(req.body?.templateUrl || saved.templateUrl || "").trim();
+  if (!templateUrl) return res.status(400).json({ message: "Upload a slide template first." });
+  // Intro sample follows the Subject / Topic switches.
+  const introHead = [cfg.showSubject !== false && "Subject", cfg.showTopic !== false && "Topic"].filter(Boolean).join(" — ") || "Quiz Time";
+  const SAMPLE = {
+    // Marathon intros say "Top N Questions of <Topic>" / "Marathon Quiz".
+    intro: marathon ? { headline: "Top 1000 Questions of Topic Name", badge: "Marathon Quiz" } : { headline: introHead, badge: "Let's begin!" },
+    outro: { headline: "Thanks for watching!", badge: "Subscribe · Like · Share for more" },
+    shortintro: marathon ? { headline: "Top 1000 Questions of Topic Name", badge: "Marathon Quiz" } : { headline: introHead, badge: "Let's begin!" },
+    shortoutro: { headline: "Thanks for watching!", badge: "Watch the full quiz — visit the channel" },
+  }[role];
+  const { renderYoutubeThumbnail } = await import("../config/ytThumbnail.js");
+  const r = await renderYoutubeThumbnail({
+    ...cfg, templateUrl, width: vertical ? 1080 : 1920, height: vertical ? 1920 : 1080,
+    lines: { kicker: "", headline: SAMPLE.headline, badge: SAMPLE.badge },
+    brandColor: site.brandColor || site.primaryColor,
+  });
+  if (!r.image) return res.status(400).json({ message: r.error || "Could not draw the slide." });
+  res.set("Cache-Control", "no-store");
+  res.json({ image: `data:${r.mime};base64,${r.image.toString("base64")}` });
+}
+
+// POST /api/youtube/narration-preview { role, text?, engine?, voice? }
+// → { audio: "data:audio/…;base64,…", voice, provider, note } — "Preview voice"
+// in the intro / end slide editors: speaks the line (with its [pause] marks)
+// exactly as the video will, with the long-video form's engine + voice. Empty
+// text = the slide's default line. Admin only; nothing is saved.
+export async function youtubeNarrationPreview(req, res) {
+  const b = req.body || {};
+  const role = ["intro", "outro", "shortintro", "shortoutro"].includes(b.role) ? b.role : "outro";
+  const { DEFAULT_OUTRO_NARRATION } = await import("../config/slidePlan.js");
+  const fallback = role === "outro" ? DEFAULT_OUTRO_NARRATION.full
+    : role === "shortoutro" ? DEFAULT_OUTRO_NARRATION.short
+    : "Subject — Topic. Let's begin the quiz.";
+  const text = String(b.text || "").replace(/\s+/g, " ").trim().slice(0, 400) || fallback;
+  const cfg = await getFacebookConfig();
+  const saved = await getFacebookSiteForConfig(cfg);
+  const base = saved ? { ...(saved.toObject ? saved.toObject() : saved) } : {};
+  const { TTS_PROVIDERS } = await import("../utils/ttsVoices.js");
+  const engine = String(b.engine || "").trim().toLowerCase();
+  if (TTS_PROVIDERS.includes(engine)) base.ttsProvider = engine;
+  try {
+    const { previewNarration } = await import("../config/slideshow.js");
+    const r = await previewNarration({ text, voice: String(b.voice || base.slideshowVoice || "").slice(0, 120), site: base });
+    res.set("Cache-Control", "no-store");
+    res.json({ audio: `data:${r.mime};base64,${r.buffer.toString("base64")}`, voice: r.voice, provider: r.provider, note: r.note || "" });
+  } catch (e) {
+    res.status(400).json({ message: e?.message || "Could not make the voice preview." });
+  }
+}
+
+// GET /api/youtube/fonts/:key — the bundled thumbnail / slide fonts (OFL), so
+// the editor's instant preview draws with the same font as the server. Public,
+// static, cached; only the fixed font keys are served.
+export async function youtubeFontFile(req, res) {
+  const { bundledFontPath } = await import("../config/ytThumbnail.js");
+  const file = bundledFontPath(String(req.params.key || ""));
+  if (!file) return res.status(404).end();
+  res.set("Cache-Control", "public, max-age=2592000, immutable");
+  res.set("Access-Control-Allow-Origin", "*");
+  res.type("font/ttf");
+  res.sendFile(file, (err) => { if (err && !res.headersSent) res.status(404).end(); });
+}
+
+// POST /api/youtube/videos/:videoId/finish { title?, useThumbnail?, playlist?:{id,title} }
+// After a browser upload (your own video): set the template thumbnail and/or
+// add it to a playlist. → { notes:[…] }
+export async function youtubeFinishUpload(req, res) {
+  const videoId = String(req.params.videoId || "");
+  if (!/^[A-Za-z0-9_-]{6,20}$/.test(videoId)) return res.status(400).json({ message: "Invalid video id." });
+  const site = await getOrCreateOwn();
+  const cfg = youtubeConfigFromSite(site);
+  if (!isYoutubeConfigured(cfg)) return res.status(400).json({ message: "Connect YouTube first." });
+  const b = req.body || {};
+  const playlist = playlistFields(b.playlist);
+  const notes = await applyYtExtras({
+    videoId,
+    thumb: b.useThumbnail ? { ...cfg.ytThumb, lines: thumbnailLines({ title: String(b.title || "").slice(0, 100) }) } : null,
+    playlist: playlist.id ? playlist : null,
+    brandColor: site.brandColor || site.primaryColor,
+  }, cfg);
+  res.json({ notes });
+}

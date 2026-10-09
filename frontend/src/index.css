@@ -1,0 +1,243 @@
+/* NOTE: the Inter web font is loaded via <link rel="preconnect"> + a
+   <link rel="stylesheet"> in index.html, NOT a CSS @import here. A CSS @import
+   is only discovered after this stylesheet downloads and parses, creating a
+   render-blocking request waterfall (slow first paint, especially on mobile);
+   the <link> is found immediately by the browser's preload scanner and fetched
+   in parallel. */
+
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+/* Default theme palette (RGB channels). The admin panel overrides these at
+   runtime to recolour the whole site. Defaults = blue/orange brand. */
+:root {
+  --brand-50: 239 246 255;
+  --brand-100: 219 234 254;
+  --brand-200: 191 219 254;
+  --brand-300: 147 197 253;
+  --brand-400: 96 165 250;
+  --brand-500: 59 130 246;
+  --brand-600: 37 99 235;
+  --brand-700: 29 78 216;
+  --brand-800: 30 64 175;
+  --brand-900: 30 58 138;
+
+  --accent-50: 255 247 237;
+  --accent-100: 255 237 213;
+  --accent-200: 254 215 170;
+  --accent-300: 253 186 116;
+  --accent-400: 251 146 60;
+  --accent-500: 249 115 22;
+  --accent-600: 234 88 12;
+  --accent-700: 194 65 12;
+  --accent-800: 154 52 18;
+  --accent-900: 124 45 18;
+
+  --app-font: "Inter", ui-sans-serif, system-ui, sans-serif;
+}
+
+@layer base {
+  html {
+    scroll-behavior: smooth;
+    font-family: var(--app-font);
+    /* iOS Safari auto-INFLATES text ("text size adjust") on many layouts, so
+       cards, options and spacing came out larger/differently than on Android /
+       Chrome. Locking this to 100% makes typography render IDENTICALLY across
+       iOS and Android. Safe no-op on browsers that don't inflate. */
+    -webkit-text-size-adjust: 100%;
+    text-size-adjust: 100%;
+    /* Stop the mobile browser's pull-to-refresh gesture from reloading the page
+       (it triggers easily after pinch-zooming out and swiping at the top). */
+    overscroll-behavior-y: contain;
+  }
+  body {
+    @apply bg-slate-50 text-slate-800 antialiased transition-colors duration-300 dark:bg-slate-950 dark:text-slate-100;
+    overscroll-behavior-y: contain;
+  }
+  /* Site-wide paragraph rule: EVERY <p>, anywhere on the site (and any added
+     later), fills its container edge-to-edge and is justified — including
+     hero/intro paragraphs that use text-center and a max-w-* cap.
+       • max-width:100% cancels a self-imposed cap so the text spans the full
+         container width; with the cap gone, mx-auto centering collapses to 0 =
+         flush left/right.
+       • text-align:justify overrides text-center/left on the element too.
+     Both use !important so they win over Tailwind utilities on the paragraph.
+     The little side margin comes from the page container's padding, and it works
+     in every browser. Single-line paragraphs are visually unaffected by justify.
+     Headings, buttons, links, labels and table cells are untouched (only <p>). */
+  p {
+    max-width: 100% !important;
+    text-align: justify !important;
+    text-justify: inter-word;
+    /* Default paragraph text size → 12px. Kept in rem (0.75rem @ 16px root) so
+       it still scales with the site zoom control. !important so it applies even
+       to paragraphs that carry a Tailwind text-* size utility. */
+    font-size: 0.75rem !important;
+  }
+  /* Small / helper paragraphs (text-xs, text-sm — incl. responsive variants like
+     sm:text-sm) → 11px. Attribute-substring match so it also covers the
+     breakpoint-prefixed forms. Higher specificity than the base rule, so it wins. */
+  p[class*="text-xs"],
+  p[class*="text-sm"] {
+    font-size: 0.6875rem !important; /* 11px */
+  }
+  /* Intro / large paragraphs (text-lg, text-xl — incl. sm:text-lg etc.) → 16px. */
+  p[class*="text-lg"],
+  p[class*="text-xl"] {
+    font-size: 1rem !important; /* 16px */
+  }
+  /* Entity "description" text (stream / subject / topic / exam / node / file
+     descriptions) is a fixed 9px everywhere it appears. Placed AFTER the size
+     tiers and scoped as p.desc so it wins over them and over the base rule; 9px
+     in px (not rem) to match the original compact card look. */
+  p.desc {
+    font-size: 9px !important;
+  }
+}
+
+@layer components {
+  .container-page {
+    /* Fully fluid, full-width layout (navbar + all public pages use this): the
+       content adapts to WHATEVER the screen size is — no fixed max-width cap —
+       so it fills small laptops and large monitors alike. Side padding grows a
+       little on bigger screens for breathing room. */
+    @apply mx-auto w-full px-4 sm:px-6 lg:px-8 2xl:px-12;
+  }
+  .btn {
+    @apply inline-flex items-center justify-center gap-2 rounded-xl px-5 py-2.5 text-sm font-semibold transition-all duration-200 focus:outline-none focus:ring-2 focus:ring-offset-2 disabled:cursor-not-allowed disabled:opacity-60;
+  }
+  .btn-primary {
+    @apply btn bg-brand-600 text-white shadow-soft hover:bg-brand-700 focus:ring-brand-500;
+  }
+  .btn-accent {
+    @apply btn bg-accent-500 text-white shadow-glow hover:bg-accent-600 focus:ring-accent-400;
+  }
+  .btn-outline {
+    @apply btn border border-slate-300 bg-white text-slate-700 hover:border-brand-400 hover:text-brand-600 dark:border-slate-700 dark:bg-slate-900 dark:text-slate-200 dark:hover:border-brand-500;
+  }
+  .btn-ghost {
+    @apply btn text-slate-600 hover:bg-slate-100 dark:text-slate-300 dark:hover:bg-slate-800;
+  }
+  .card {
+    @apply rounded-2xl border border-slate-200 bg-white shadow-sm transition-all duration-300 dark:border-slate-800 dark:bg-slate-900;
+  }
+  .card-hover {
+    @apply card hover:-translate-y-1 hover:border-brand-300 hover:shadow-soft dark:hover:border-brand-700;
+  }
+  .input {
+    @apply w-full rounded-xl border border-slate-300 bg-white px-4 py-2.5 text-sm text-slate-800 placeholder-slate-400 transition focus:border-brand-500 focus:outline-none focus:ring-2 focus:ring-brand-200 dark:border-slate-700 dark:bg-slate-900 dark:text-slate-100 dark:placeholder-slate-500 dark:focus:ring-brand-900;
+  }
+  .badge {
+    @apply inline-flex items-center gap-1 rounded-full px-2.5 py-0.5 text-xs font-medium;
+  }
+}
+
+/* Stop iOS Safari (and other mobile browsers) from auto-zooming the page when a
+   form field is focused: it zooms whenever the focused control's font-size is
+   below 16px, and our inputs use text-sm (14px). Force >=16px on TOUCH devices
+   only (phones/tablets). iOS only checks the font-size at the moment a field is
+   FOCUSED, so we bump to 16px on :focus only — the field keeps the app's normal
+   small text (matching the rest of the UI) when idle, and there's no zoom while
+   typing. !important overrides Tailwind's text-sm/text-xs utilities on inputs. */
+@media (hover: none) and (pointer: coarse) {
+  input:not([type="checkbox"]):not([type="radio"]):not([type="range"]):focus,
+  textarea:focus,
+  select:focus {
+    font-size: 16px !important;
+    /* Proportional leading so the 16px focused text isn't cramped/clipped. */
+    line-height: 1.5 !important;
+  }
+}
+
+/* Scrolling notice board (marquee) — moves content right → left, loops. */
+@keyframes marquee {
+  0% {
+    transform: translateX(0);
+  }
+  100% {
+    transform: translateX(-50%);
+  }
+}
+.animate-marquee {
+  animation: marquee var(--marquee-duration, 30s) linear infinite;
+  /* Promote to its own GPU layer so the continuous scroll is composited off the
+     main thread (smoother, less main-thread work on iOS). */
+  will-change: transform;
+}
+.marquee-track:hover .animate-marquee {
+  animation-play-state: paused;
+}
+/* Respect the OS "Reduce Motion" setting: stop the perpetual scroll entirely
+   (a constantly-animating banner is battery- and jank-heavy on phones). */
+@media (prefers-reduced-motion: reduce) {
+  .animate-marquee {
+    animation: none;
+    will-change: auto;
+  }
+}
+
+/* Content protection: block selection/copy for students (inputs stay usable). */
+.no-select,
+.no-select * {
+  -webkit-user-select: none !important;
+  -moz-user-select: none !important;
+  user-select: none !important;
+  -webkit-touch-callout: none !important;
+}
+.no-select input,
+.no-select textarea,
+.no-select [contenteditable="true"] {
+  -webkit-user-select: text !important;
+  -moz-user-select: text !important;
+  user-select: text !important;
+}
+
+/* custom scrollbar */
+::-webkit-scrollbar {
+  width: 10px;
+  height: 10px;
+}
+::-webkit-scrollbar-track {
+  background: transparent;
+}
+::-webkit-scrollbar-thumb {
+  background: #cbd5e1;
+  border-radius: 9999px;
+}
+.dark ::-webkit-scrollbar-thumb {
+  background: #334155;
+}
+
+
+/* --- KaTeX line fix ---------------------------------------------------------
+   KaTeX draws fraction bars, sqrt/overline/underline vinculums and \rule using
+   element BORDERS. Tailwind's Preflight resets every element's border-color to a
+   faint gray, which makes those lines nearly invisible — the fraction "divide"
+   bar in $\frac{a}{b}$ disappears. Force these rules back to the current text
+   colour so they render in both light and dark mode. */
+.katex .frac-line,
+.katex .overline .overline-line,
+.katex .underline .underline-line,
+.katex .hline,
+.katex .hdashline,
+.katex .rule {
+  border-color: currentColor !important;
+}
+.katex .frac-line { border-bottom-color: currentColor !important; }
+
+
+/* ---------------------------------------------------------------------------
+   Installed PWA (iOS / Android standalone) — respect the device safe areas so
+   the sticky top bar doesn't sit under the status bar / notch, and page bottom
+   content clears the home indicator. Only applies when launched as an app.
+   (Requires <meta name="viewport" content="...viewport-fit=cover">, which is set.)
+   ------------------------------------------------------------------------ */
+@media (display-mode: standalone) {
+  header.sticky.top-0 {
+    padding-top: env(safe-area-inset-top);
+  }
+  body {
+    padding-bottom: env(safe-area-inset-bottom);
+  }
+}

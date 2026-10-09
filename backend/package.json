@@ -1,0 +1,57 @@
+{
+  "name": "post-me-backend",
+  "version": "1.0.0",
+  "description": "REST API for Post Me — social media auto-posting & content generation for clients (MongoDB or DynamoDB via DB_ENGINE)",
+  "type": "module",
+  "main": "src/server.js",
+  "engines": {
+    "node": ">=18"
+  },
+  "scripts": {
+    "start": "node src/server.js",
+    "dev": "node --watch src/server.js",
+    "test": "vitest run",
+    "test:watch": "vitest",
+    "coverage": "vitest run --coverage",
+    "create-tables": "node src/scripts/createTablesCli.js"
+  },
+  "keywords": [
+    "social-media",
+    "auto-posting",
+    "facebook",
+    "instagram",
+    "youtube",
+    "telegram",
+    "express"
+  ],
+  "license": "UNLICENSED",
+  "dependencies": {
+    "@aws-sdk/client-dynamodb": "^3.658.0",
+    "@aws-sdk/lib-dynamodb": "^3.658.0",
+    "@smithy/node-http-handler": "^3.2.0",
+    "bcryptjs": "^2.4.3",
+    "cloudinary": "^2.5.1",
+    "compression": "^1.7.4",
+    "cors": "^2.8.5",
+    "dotenv": "^16.4.5",
+    "express": "^4.21.1",
+    "express-rate-limit": "^7.4.1",
+    "helmet": "^8.0.0",
+    "jsonwebtoken": "^9.0.2",
+    "mathjax-full": "^3.2.2",
+    "mongodb": "^6.9.0",
+    "mongoose": "^8.8.0",
+    "morgan": "^1.10.0",
+    "multer": "^2.0.0",
+    "nodemailer": "^9.0.3",
+    "puppeteer-core": "^23.11.1",
+    "uuid": "^9.0.1",
+    "word-list": "^4.1.0",
+    "ws": "^8.21.3"
+  },
+  "devDependencies": {
+    "@vitest/coverage-v8": "^2.1.9",
+    "mongodb-memory-server": "^10.1.4",
+    "vitest": "^2.1.9"
+  }
+}

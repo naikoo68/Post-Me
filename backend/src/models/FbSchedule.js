@@ -1,0 +1,171 @@
+import mongoose from "../db/odm.js";
+
+// A scheduled Facebook auto-post rule. At each scheduled time it picks a
+// question from the chosen content scope (subject / session / quiz / test) and
+// posts it to the configured Facebook Page. Independent of the Notice Board.
+const fbScheduleSchema = new mongoose.Schema(
+  {
+    title: { type: String, default: "" }, // admin label, e.g. "Daily Accountancy question"
+    enabled: { type: Boolean, default: true },
+
+    // Post type:
+    //   "question"  (default) — draw a question from `source` and post it (existing behaviour).
+    //   "custom"              — post a fixed admin-written text + uploaded media (no question).
+    //   "flashcard"           — draw a question from `source` and post it as a combined
+    //                           flashcard image (question panel + answer panel).
+    //   "slideshow"           — draw a question from `source` and post it as a narrated
+    //                           2-slide Reel (slide 1 = question, slide 2 = answer).
+    kind: { type: String, enum: ["question", "custom", "flashcard", "slideshow", "longvideo"], default: "question" },
+    // Cross-posting user this schedule posts for (Settings _id of their
+    // profile, see utils/socialProfile.js). "" / missing = the main account.
+    profileId: { type: String, default: "", index: true },
+    // For a schedule copied from the main account: the original schedule id
+    // (so copying again doesn't make duplicates).
+    copiedFrom: { type: String, default: "" },
+    // kind "longvideo": a REPEATING long (16:9) video schedule — each due time
+    // makes the next part of the topic as one video (YouTube and/or Facebook).
+    // { options, title, privacy, playlist, useThumbnail, nextStart, part } —
+    // see config/longVideo.js (pickLongVideoScheduleFields).
+    longVideo: { type: mongoose.Schema.Types.Mixed, default: null },
+    // Custom-post content (used only when kind === "custom").
+    customText: { type: String, default: "" }, // the post text / caption
+    customMedia: { type: [String], default: [] }, // hosted image URLs; the first image is attached
+    // A public video URL. When set, the custom post is published as a REEL
+    // (short vertical video) to the selected networks instead of a photo. Takes
+    // priority over customMedia (post either a Reel OR a photo).
+    customVideo: { type: String, default: "" },
+
+    // Reel mode for question/flashcard schedules. When `asReel` is on, each run
+    // renders the question/flashcard card image (exactly as a normal auto-post)
+    // and then mixes it with a music track into a vertical MP4, published as a
+    // Reel instead of a photo.
+    asReel: { type: Boolean, default: false },
+    // Reel length in seconds — the composed video is trimmed to this (default 30s).
+    reelDuration: { type: Number, default: 30 },
+    // Also share the post's IMAGE as a 24h STORY to the selected networks
+    // (Facebook Page Story + Instagram Story), in addition to the normal post.
+    asStory: { type: Boolean, default: false },
+    // Save the Facebook post / Reel / AI Slideshow as an unpublished Page DRAFT
+    // instead of publishing it — the admin reviews and publishes it in Meta
+    // Business Suite. Stories (no draft in Facebook) and other networks are
+    // unaffected. Long-video schedules keep this in longVideo.options.fbDraft.
+    fbDraft: { type: Boolean, default: false },
+    // The latest successful post's media + texts (utils/lastPost.js), so the
+    // admin can Download / Copy it from the schedule row and re-upload by hand.
+    // { at, media: [{ type, label, url }], texts: [{ label, text }] } | null
+    lastPost: { type: mongoose.Schema.Types.Mixed, default: null },
+    // A LIBRARY of music tracks (public URLs). The schedule ROTATES through them
+    // — each Reel uses the next track, wrapping back to the first once every
+    // track has been used — so a set of songs is reused without re-uploading.
+    customAudios: { type: [String], default: [] },
+    // Which track to use next (index into customAudios); advances after each Reel.
+    audioIndex: { type: Number, default: 0 },
+    // DEPRECATED single-track field, kept for backward compatibility with
+    // schedules created before the rotating library existed.
+    customAudio: { type: String, default: "" },
+
+    // ---- AI Educational Slideshow + Text-to-Speech (Reel) --------------------
+    // When `asSlideshow` is on, each run builds an EDUCATIONAL slideshow video
+    // from the SAME selected question: branded 9:16 slides (question → options →
+    // answer → explanation → recall → brand/CTA) narrated by AI text-to-speech,
+    // combined into a single MP4 and published through the EXISTING Reel
+    // pipeline (Facebook Reel + Instagram Reel). The narration IS the audio, so
+    // this mode does NOT use the music Reel library — when `asSlideshow` is true
+    // the normal music Reel (`asReel`) is ignored (see runScheduleOnce).
+    // Set automatically for kind "slideshow"; older schedules may carry it on a
+    // "question" kind (treated as a slideshow too).
+    asSlideshow: { type: Boolean, default: false },
+    // How long each of the two slides stays on screen, in seconds. The slide
+    // stays up LONGER if the narration needs more time (the voice is never cut).
+    questionSec: { type: Number, default: 10 }, // slide 1: question + options
+    answerSec: { type: Number, default: 8 },    // slide 2: answer reveal
+    // How many questions go into ONE slideshow video (each = question slide +
+    // answer slide). 1–10.
+    slideshowQuestions: { type: Number, default: 1 },
+    // Which OpenAI TTS voice narrates the slides (validated against ttsVoices.js).
+    ttsVoice: { type: String, default: "coral" },
+    // Burn a readable caption band (the slide's narration) onto each slide.
+    autoCaptions: { type: Boolean, default: true },
+    // Optional: generate an AI illustration per slide (kept OFF by default for
+    // cost control — branded template slides are always used; this flag is a
+    // forward-compat hook for when an AI image provider is wired in).
+    generateImages: { type: Boolean, default: false },
+    // Lightweight job status for the (potentially slow) slideshow render, so the
+    // admin can see where a run got to. One of: "", PENDING, GENERATING_SLIDES,
+    // GENERATING_AUDIO, RENDERING_VIDEO, READY, PUBLISHING, PUBLISHED, FAILED.
+    slideshowStatus: { type: String, default: "" },
+    // The last slideshow-generation error message (for admin visibility).
+    slideshowError: { type: String, default: "" },
+
+    // Where questions are drawn from. The DEEPEST set id wins (quiz > session >
+    // subject > testSeries). `label` is a human-readable trail for the UI.
+    source: {
+      label: { type: String, default: "" },
+      subject: { type: mongoose.Schema.Types.ObjectId, ref: "Subject", default: null },
+      session: { type: mongoose.Schema.Types.ObjectId, ref: "Session", default: null },
+      quiz: { type: mongoose.Schema.Types.ObjectId, ref: "Quiz", default: null },
+      testSeries: { type: mongoose.Schema.Types.ObjectId, ref: "TestSeries", default: null },
+      // A whole TOPIC (no single quiz): Quiz Bank topic, or a My Quiz topic.
+      topic: { type: mongoose.Schema.Types.ObjectId, ref: "Topic", default: null },
+      practiceTopic: { type: mongoose.Schema.Types.ObjectId, ref: "PracticeTopic", default: null },
+      // A single specific question (set from the question view). When present it
+      // overrides the scope above — the schedule posts exactly this question.
+      question: { type: mongoose.Schema.Types.ObjectId, ref: "Question", default: null },
+    },
+
+    // "recurring" = post at `times` on `days`; "once" = post a single time at `runAt`.
+    mode: { type: String, enum: ["recurring", "once"], default: "recurring" },
+    runAt: { type: Date, default: null }, // one-off scheduled time (mode "once")
+
+    // When to post (recurring). `times` are "HH:MM" (24h) in `timezone`.
+    // `days` = weekdays 0(Sun)–6(Sat); empty means every day.
+    times: { type: [String], default: [] },
+    days: { type: [Number], default: [] },
+    timezone: { type: String, default: "Asia/Kolkata" },
+
+    // Post formatting.
+    includeOptions: { type: Boolean, default: true }, // show the A/B/C/D options
+    includeAnswer: { type: Boolean, default: false }, // reveal the correct answer + explanation
+    includeLink: { type: Boolean, default: false }, // append the site link
+    hashtags: { type: String, default: "" }, // optional trailing hashtags
+    order: { type: String, enum: ["random", "sequential"], default: "random" },
+    // When true (default), the schedule STOPS once every question in its source
+    // has been posted (no repeats): it disables itself and stamps `completedAt`.
+    // When false it recycles the pool and keeps posting forever (old behaviour).
+    stopWhenExhausted: { type: Boolean, default: true },
+
+    // Destinations & format.
+    toFacebook: { type: Boolean, default: true }, // post to the Facebook Page
+    toInstagram: { type: Boolean, default: false }, // also cross-post to Instagram (forces an image)
+    toTelegram: { type: Boolean, default: false }, // also post to the Telegram channel (image / video / text)
+    // Also upload the video to YouTube as a Short (needs a video: Reel, AI
+    // Slideshow or a custom video). Title = ytTitle + " #N" (fixed, numbered).
+    toYoutube: { type: Boolean, default: false },
+    ytTitle: { type: String, default: "" }, // e.g. "Daily GK Quiz" → "Daily GK Quiz #12" ({n} places the number)
+    ytPostCount: { type: Number, default: 0 }, // YouTube uploads so far → the next title number
+    // When the LAST question of the source has been posted, also upload the
+    // whole source as ONE long 16:9 YouTube video ("… | Full Quiz (25 Questions)").
+    ytFullVideo: { type: Boolean, default: false },
+    // Playlist ("folder") for this schedule's Shorts. Blank = the default
+    // Shorts playlist from the YouTube settings (if any).
+    ytPlaylistId: { type: String, default: "" },
+    ytPlaylistTitle: { type: String, default: "" },
+    asImage: { type: Boolean, default: false }, // render the question as an image card (Facebook)
+    imageUrl: { type: String, default: "" }, // pre-captured screenshot (client-rendered) to post as-is
+
+    // Runtime bookkeeping.
+    postedQuestionIds: { type: [mongoose.Schema.Types.ObjectId], default: [] }, // avoid repeats until exhausted
+    // Don't fire before this moment (a repeating schedule's start date & time).
+    startAt: { type: Date, default: null },
+    lastSlot: { type: String, default: "" }, // "YYYY-MM-DD HH:MM" of the last fired slot (dedupe guard)
+    lastRunAt: { type: Date, default: null },
+    lastResult: { type: String, default: "" }, // last outcome (ok / error) for admin visibility
+    postCount: { type: Number, default: 0 },
+    poolSize: { type: Number, default: 0 }, // total questions in the source at the last run (for "X of Y posted")
+    completedAt: { type: Date, default: null }, // set when the source was fully posted (stopWhenExhausted)
+    createdBy: { type: mongoose.Schema.Types.ObjectId, ref: "User", default: null },
+  },
+  { timestamps: true }
+);
+
+export default mongoose.model("FbSchedule", fbScheduleSchema);

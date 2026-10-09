@@ -1,0 +1,76 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+
+    <!-- Guard against the "Failed to execute 'removeChild' / 'insertBefore' on
+         'Node'" crash that browser page-translation (Google / Brave Translate)
+         triggers by swapping out React-managed text nodes. If the target's
+         parent no longer matches, no-op instead of throwing so the app keeps
+         running. Applied before React loads. See facebook/react#11538. -->
+    <script>
+      (function () {
+        if (typeof Node !== "function" || !Node.prototype) return;
+        var realRemoveChild = Node.prototype.removeChild;
+        Node.prototype.removeChild = function (child) {
+          if (child.parentNode !== this) return child;
+          return realRemoveChild.apply(this, arguments);
+        };
+        var realInsertBefore = Node.prototype.insertBefore;
+        Node.prototype.insertBefore = function (newNode, referenceNode) {
+          if (referenceNode && referenceNode.parentNode !== this) return newNode;
+          return realInsertBefore.apply(this, arguments);
+        };
+      })();
+    </script>
+
+    <link rel="icon" type="image/svg+xml" href="/favicon.svg" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover" />
+    <!-- Site zoom (default 80%) BEFORE the first paint, so the page never flashes
+         at 100%. The visitor's own choice wins, else the admin default (cached
+         settings), else 80%. Server-screenshot pages stay at 100%.
+         Kept in sync with src/lib/pageZoom.js + src/context/ZoomContext.jsx. -->
+    <script>
+      (function () {
+        try {
+          if (/^\/(q-card|flashcard|slide-card)(\/|$)/.test(location.pathname)) return;
+          var z = 0.8, s = NaN;
+          try { s = parseFloat(localStorage.getItem("msg-zoom-v3")); } catch (e) {}
+          if (s >= 0.5 && s <= 2) z = s;
+          else {
+            try {
+              var c = JSON.parse(localStorage.getItem("msg-settings") || "{}");
+              var p = Number(c && c.defaultZoom);
+              if (p >= 50 && p <= 200) z = p / 100;
+            } catch (e) {}
+          }
+          var d = document.documentElement;
+          d.style.zoom = String(z);
+          d.style.setProperty("--unzoom", String(1 / z));
+        } catch (e) {}
+      })();
+    </script>
+    <meta name="theme-color" content="#2563eb" />
+    <link rel="preconnect" href="https://fonts.googleapis.com" />
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+    <link
+      rel="stylesheet"
+      href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800;900&display=swap"
+    />
+    <title>Post Me — Social Media Auto Posting</title>
+    <meta
+      name="description"
+      content="Post Me automatically turns your content into images, reels and videos and posts them to Facebook, Instagram, YouTube and Telegram on schedule."
+    />
+    <meta name="author" content="Post Me" />
+    <meta property="og:type" content="website" />
+    <meta property="og:site_name" content="Post Me" />
+    <meta property="og:title" content="Post Me — Social Media Auto Posting" />
+    <meta name="twitter:card" content="summary_large_image" />
+    <meta name="twitter:title" content="Post Me — Social Media Auto Posting" />
+  </head>
+  <body>
+    <div id="root"></div>
+    <script type="module" src="/src/main.jsx"></script>
+  </body>
+</html>

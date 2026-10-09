@@ -1,0 +1,572 @@
+// AI Educational Slideshow orchestrator.
+//
+// Given ONE question (the SAME question the existing auto-poster selected), this
+// builds a narrated, branded, vertical (9:16) slideshow MP4 that the existing
+// Reel pipeline then publishes to Facebook and Instagram:
+//
+//   question → 2 slides (question, answer) → branded images (Cloudinary) →
+//   TTS narration per slide → ffmpeg MP4 (on this server) → ONE plain MP4
+//   uploaded to Cloudinary → public URL
+//
+// Slides/narration are DETERMINISTIC from the question fields (no AI text/image
+// calls). The only external services are the TTS provider (free by default) and
+// the project's existing Cloudinary account.
+//
+// Every step throws a readable error on failure; the caller (the scheduler or
+// the test job) records it and, in the scheduler, falls back to a normal
+// image/text post so a run is never silently lost.
+import { cardBoxParam, cardBoxLogos } from "../utils/cardBox.js";
+import os from "node:os";
+import fs from "node:fs/promises";
+import path from "node:path";
+import { isCloudinaryConfigured, uploadFileToCloudinary } from "./cloudinary.js";
+import { resolveTtsConfig, resolveWorkingTtsConfig, synthesizeSpeech } from "./tts.js";
+import { buildSlidePlan, normalizeReadOptions, readOptionsFromSettings, introSlidePlan, outroSlidePlan } from "./slidePlan.js";
+import { chunkForGoogle } from "./googleTts.js";
+import { renderSlideImage } from "./slideRender.js";
+import { renderSlideCardShots } from "./cardShot.js";
+import { composeSlideshowMp4, isFfmpegAvailable, probeImageSize, runFfmpeg } from "./videoCompose.js";
+import { splitNarrationPauses, hasNarrationPauses, stripNarrationPauses } from "../utils/narrationPauses.js";
+import { normalizeVoiceForProvider, voiceForFallback } from "../utils/ttsVoices.js";
+
+// Job-status states (mirrored onto the schedule's slideshowStatus for the UI).
+export const SLIDESHOW_STATUS = {
+  PENDING: "PENDING",
+  GENERATING_SLIDES: "GENERATING_SLIDES",
+  GENERATING_AUDIO: "GENERATING_AUDIO",
+  RENDERING_VIDEO: "RENDERING_VIDEO",
+  READY: "READY",
+  PUBLISHING: "PUBLISHING",
+  PUBLISHED: "PUBLISHED",
+  FAILED: "FAILED",
+};
+
+// Media processing needs Cloudinary (slide images + final video hosting). The
+// free TTS providers need no key, and ffmpeg is checked when a job runs.
+export function isSlideshowConfigured() {
+  return isCloudinaryConfigured();
+}
+
+// Download a hosted file (the rasterised slide image) to a local path.
+async function downloadTo(url, dest, { timeoutMs = 60000 } = {}) {
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), timeoutMs);
+  try {
+    const res = await fetch(url, { signal: controller.signal });
+    if (!res.ok) throw new Error(`Could not download slide image (${res.status}).`);
+    const buf = Buffer.from(await res.arrayBuffer());
+    if (!buf.length) throw new Error("Slide image download was empty.");
+    await fs.writeFile(dest, buf);
+  } catch (e) {
+    if (e?.name === "AbortError") throw new Error("Timed out downloading a slide image.");
+    throw e;
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+// A full explanation + key points + quick recall can be longer than one TTS
+// request allows (synthesizeSpeech hard-caps at 1200 characters and would CUT
+// the rest). Split long narration at sentence boundaries, synthesize each part
+// and join the MP3s (same encoder settings, so they play back-to-back).
+const TTS_PART_CHARS = 1000;
+async function synthesizeLongSpeech({ text, voice, cfg }) {
+  const parts = chunkForGoogle(text, TTS_PART_CHARS);
+  if (parts.length <= 1) return synthesizeSpeech({ text, voice, cfg });
+  const buffers = [];
+  let usedVoice = voice;
+  for (const part of parts) {
+    const r = await synthesizeSpeech({ text: part, voice, cfg });
+    buffers.push(r.buffer);
+    usedVoice = r.voice || usedVoice;
+  }
+  return { buffer: Buffer.concat(buffers), voice: usedVoice };
+}
+
+// Narration with pause marks ("Thanks for watching! [pause 2] Subscribe…"):
+// each text part is spoken separately and REAL silence is put between them, so
+// it works the same on every voice engine. Writes one audio file → its path.
+//
+// Voice engines pad every clip with their own silence (often 0.3–1 s at each
+// end), which made "[pause 1]" last 2–3 s. So each spoken part is TRIMMED of
+// its leading / trailing silence first, and then exactly the pause you set is
+// inserted — "[pause 1]" is 1 second between the words.
+const TRIM_SILENCE =
+  "silenceremove=start_periods=1:start_duration=0:start_threshold=-50dB:detection=peak," +
+  "areverse," +
+  "silenceremove=start_periods=1:start_duration=0:start_threshold=-50dB:detection=peak," +
+  "areverse";
+// parts: [{ file } | { pause }] → ffmpeg args (pure; tested).
+export function pauseConcatArgs(parts, outPath) {
+  const inputs = [];
+  const labels = [];
+  parts.forEach((p, n) => {
+    if (p.file) inputs.push("-i", p.file);
+    else inputs.push("-f", "lavfi", "-t", String(p.pause), "-i", "anullsrc=r=24000:cl=mono");
+    const norm = "aresample=24000,aformat=sample_fmts=fltp:channel_layouts=mono";
+    labels.push(`[${n}:a]${norm}${p.file ? `,${TRIM_SILENCE}` : ""}[a${n}]`);
+  });
+  const filter = `${labels.join(";")};${labels.map((_, i) => `[a${i}]`).join("")}concat=n=${parts.length}:v=0:a=1[out]`;
+  return ["-hide_banner", "-loglevel", "error", "-y", ...inputs, "-filter_complex", filter, "-map", "[out]", "-c:a", "aac", "-b:a", "128k", outPath];
+}
+
+async function synthesizeWithPauses({ text, voice, cfg, workDir, name }) {
+  const parts = [];
+  for (const part of splitNarrationPauses(text)) {
+    if (part.text) {
+      const r = await synthesizeLongSpeech({ text: part.text, voice, cfg });
+      const file = path.join(workDir, `${name}-part${parts.length}.mp3`);
+      await fs.writeFile(file, r.buffer);
+      parts.push({ file });
+    } else {
+      parts.push({ pause: part.pause });
+    }
+  }
+  if (!parts.length) return null;
+  const outPath = path.join(workDir, `${name}.m4a`);
+  await runFfmpeg(pauseConcatArgs(parts, outPath), { timeoutMs: 120000 });
+  return outPath;
+}
+
+// "Preview voice" in the slide editors: speak ONE intro / end line exactly as
+// the video will (same engine, voice, pause handling). → { buffer, mime, voice, provider, note }
+export async function previewNarration({ text, voice: wantVoice, site } = {}) {
+  const line = String(text || "").trim().slice(0, 400);
+  if (!line) throw new Error("Nothing to say — type the narration first.");
+  const ttsCfg = await resolveWorkingTtsConfig(resolveTtsConfig(site || null));
+  const voice = ttsCfg.requestedProvider
+    ? voiceForFallback(ttsCfg.provider, wantVoice)
+    : normalizeVoiceForProvider(ttsCfg.provider, wantVoice);
+  const note = ttsCfg.requestedProvider ? `${ttsCfg.requestedProvider} is unavailable here — used ${ttsCfg.provider} "${voice}".` : "";
+  if (!hasNarrationPauses(line)) {
+    const r = await synthesizeLongSpeech({ text: line, voice, cfg: ttsCfg });
+    return { buffer: r.buffer, mime: "audio/mpeg", voice, provider: ttsCfg.provider, note };
+  }
+  if (!(await isFfmpegAvailable())) throw new Error("ffmpeg is not installed on the server — pauses can't be previewed.");
+  const workDir = await fs.mkdtemp(path.join(os.tmpdir(), "msg-narr-"));
+  try {
+    const p = await synthesizeWithPauses({ text: line, voice, cfg: ttsCfg, workDir, name: "preview" });
+    return { buffer: await fs.readFile(p), mime: "audio/mp4", voice, provider: ttsCfg.provider, note };
+  } finally {
+    await fs.rm(workDir, { recursive: true, force: true }).catch(() => {});
+  }
+}
+
+// "both" = question + answer slide per question (default); "question" = only
+// the question slide. Anything else → "both".
+export function normalizeSlidesMode(v) {
+  return String(v || "").trim().toLowerCase() === "question" ? "question" : "both";
+}
+
+// A 1×1 fully transparent PNG — the "no text" layer over a template.
+const TRANSPARENT_PNG = Buffer.from("iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAAC0lEQVR4nGNgAAIAAAUAAXpeqz8AAAAASUVORK5CYII=", "base64");
+
+// The reveal slide IS the question slide (just recoloured) → same template.
+const templateRole = (role) => (role === "reveal" ? "question" : role);
+// Title / closing slides (no question): the full video's and the Short's.
+const IO_ROLES = ["intro", "outro", "shortintro", "shortoutro"];
+
+// Question-only mode's answer reveal (all in seconds):
+//   pauseSec — silent thinking time after the question is read (0–15, default 3)
+//   showSec  — how long the green correct option stays up (1–15, default 3)
+//   say      — also say "The correct answer is option B: <its text>." (default on)
+// From the caller (the test form) else the site settings.
+export function revealOptions(input, site) {
+  const src = input && typeof input === "object" ? input : {
+    pauseSec: site?.slideshowRevealPauseSec,
+    showSec: site?.slideshowRevealSec,
+    say: site?.slideshowRevealSay,
+  };
+  const num = (v, def, lo, hi) => { const n = Number(v); return Number.isFinite(n) ? Math.max(lo, Math.min(hi, Math.round(n))) : def; };
+  return { pauseSec: num(src.pauseSec, 3, 0, 15), showSec: num(src.showSec, 3, 1, 15), say: src.say !== false };
+}
+
+// The reveal slide: the question slide again, with the correct option marked
+// (green). Silent unless `say`. Null when the question has no valid answer.
+export function revealSlide(qSlide, q, reveal) {
+  const idx = Number.isInteger(q?.correct) ? q.correct : -1;
+  const opt = (qSlide.options || [])[idx];
+  if (!opt) return null;
+  return {
+    ...qSlide,
+    id: "reveal",
+    role: "reveal",
+    pauses: false,
+    options: qSlide.options.map((o, i) => ({ ...o, correct: i === idx })),
+    // Say the option's TEXT too ("…option B: 1, 2 and 3."), not just the
+    // letter. `spoken` is already speech-ready (math, tables, ₹ … handled).
+    narration: reveal.say
+      ? `The correct answer is option ${opt.spokenBadge || opt.badge}${opt.spoken ? `: ${opt.spoken}` : "."}`
+      : "",
+    // Always a caption (even when silent): the caption band takes room on the
+    // card, so the question slide and its reveal must BOTH have one — then the
+    // layout is identical and only the colour changes.
+    caption: `Correct answer: ${opt.badge}${opt.text ? `. ${opt.text}` : ""}`,
+    minSec: reveal.showSec,
+  };
+}
+
+// Build the whole slideshow for `question`. Returns:
+//   { videoUrl, slides, duration, voice, provider, slidePlan }
+// `opts`:
+//   voice, autoCaptions, generateImages, brandColor, siteName, siteUrl,
+//   subjectName, questionSec, answerSec (on-screen seconds per slide),
+//   site (raw Settings doc → resolves the TTS provider/key),
+//   slidesMode — "both" (question + answer slides) or "question" (question
+//          slides only); default: the site setting slideshowSlides, else "both",
+//   read — what the narrator reads ({ question, options, explanation,
+//          keyPoints, quickRecall }; default: the site settings, all ON),
+//   onStatus(status) — a callback fired as the job progresses.
+// `question` may be ONE question or an ARRAY of questions (several questions
+// in one video: Q1 → A1 → Q2 → A2 → …).
+export async function generateSlideshow(question, opts = {}) {
+  const userOnStatus = typeof opts.onStatus === "function" ? opts.onStatus : () => {};
+  // Remember when each step started, so the server log shows where the time
+  // goes (e.g. "slides 42s, audio 18s, video 35s, upload 6s").
+  const stepMarks = [];
+  const onStatus = (st) => { stepMarks.push([st, Date.now()]); userOnStatus(st); };
+  // Fine-grained progress (stage, done, total) — kept separate from onStatus so
+  // callers that persist the status (the scheduled poster) aren't hit per slide.
+  const onProgress = typeof opts.onProgress === "function" ? opts.onProgress : () => {};
+  const questions = (Array.isArray(question) ? question : [question]).filter((x) => x && typeof x === "object");
+  // Long YouTube video mode: 16:9 1920×1080 slides, no Reel length speed-up,
+  // no 9:16 templates, and (keepFile) the MP4 is handed back as a local file
+  // instead of being hosted on Cloudinary (long videos are big).
+  const landscape = opts.orientation === "landscape";
+  const keepFile = !!opts.keepFile;
+  // No safe margin around templates: the margin was filled with a blurred copy
+  // of the template, which looked like a blurred frame round every slide.
+  const templateInset = 0;
+  // Card position on the question / answer TEMPLATES (this account's setting,
+  // or an explicit override e.g. from a preview). "" = built-in default.
+  const cardBoxRaw = opts.cardBox !== undefined ? opts.cardBox : (landscape ? opts.site?.longVideoCardBox : opts.site?.slideshowCardBox);
+  const cardBox = cardBoxParam(cardBoxRaw);
+  const cardLogos = cardBoxLogos(cardBoxRaw); // extra images placed on the template
+  if (!questions.length) throw new Error("A question is required for the slideshow.");
+  if (!isCloudinaryConfigured()) throw new Error("Cloudinary is not configured (media processing unavailable).");
+  if (!(await isFfmpegAvailable())) {
+    throw new Error("ffmpeg is not installed on the server — redeploy the backend (the Docker image installs it).");
+  }
+
+  onStatus(SLIDESHOW_STATUS.PENDING);
+  // Resolve the TTS provider/key/model from the admin settings (+ env fallback),
+  // then pick one that actually works on this host (a blocked free provider,
+  // e.g. Edge on a datacenter IP, auto-falls back to the other free provider).
+  const ttsCfg = await resolveWorkingTtsConfig(resolveTtsConfig(opts.site || null));
+  // The chosen voice — or, if the chosen provider is blocked here and the other
+  // free one is used, that provider's voice with the SAME accent.
+  const voice = ttsCfg.requestedProvider
+    ? voiceForFallback(ttsCfg.provider, opts.voice)
+    : normalizeVoiceForProvider(ttsCfg.provider, opts.voice);
+  const ttsNote = ttsCfg.requestedProvider
+    ? `${ttsCfg.requestedProvider} voices are unavailable on this server (${ttsCfg.fallbackReason || "blocked"}) — used ${ttsCfg.provider} "${voice}" instead.`
+    : "";
+  const brandOpts = {
+    brandColor: opts.brandColor || "#2563eb",
+    // `??` not `||`: a cross-posting user's brand may deliberately have NO
+    // website ("" hides the footer) — it must not fall back to ours.
+    siteName: opts.siteName ?? "Post Me",
+    siteUrl: opts.siteUrl ?? "www.mystudyguide.in",
+    // Header logo + name on the screenshotted slides ("" = built-in wordmark).
+    brandName: opts.brandName || "",
+    brandLogoUrl: opts.brandLogoUrl || "",
+    subjectName: opts.subjectName || "",
+    autoCaptions: opts.autoCaptions !== false, // default ON
+  };
+
+  // On-screen seconds for the two slides (minimums — see composeSlideshowMp4).
+  const secs = (v, def) => Math.max(3, Math.min(40, Math.round(Number(v)) || def));
+  const questionSec = secs(opts.questionSec, 10);
+  const answerSec = secs(opts.answerSec, 8);
+
+  // Optional uploaded templates (backgrounds) for the question / answer slides.
+  // The caller passes the RIGHT set: the 9:16 Reel templates, or the 16:9
+  // long-video templates for a landscape video.
+  const templates = {
+    question: String(opts.questionTemplateUrl || "").trim(),
+    answer: String(opts.answerTemplateUrl || "").trim(),
+    intro: String(opts.introTemplateUrl || "").trim(),
+    outro: String(opts.outroTemplateUrl || "").trim(),
+    shortoutro: String(opts.shortOutroTemplateUrl || "").trim(),
+    shortintro: String(opts.shortIntroTemplateUrl || "").trim(),
+  };
+
+  // 1) Plan two slides per question (question → answer; adapts to the type).
+  // What the narrator reads: the caller's choice (the test form's current
+  // toggles), else the saved site settings; everything ON by default.
+  const read = opts.read ? normalizeReadOptions(opts.read) : readOptionsFromSettings(opts.site);
+  // Which slides each question gets: "both" (question → answer, default) or
+  // "question" (question slide only — the answer isn't revealed in the video).
+  const slidesMode = normalizeSlidesMode(opts.slidesMode ?? opts.site?.slideshowSlides);
+  // Question-only mode: after the question is read, pause (thinking time),
+  // then show the SAME slide with the correct option turned green.
+  const reveal = revealOptions(opts.reveal, opts.site);
+  const plan = [];
+  const planQuestions = []; // the question each slide belongs to (same order as plan)
+  questions.forEach((q, i) => {
+    const [qSlide, aSlide] = buildSlidePlan(q, {
+      ...brandOpts,
+      // A marathon part continues the numbering of the whole video
+      // (numberFrom = questions before this part, numberTotal = all of them).
+      index: (Number(opts.numberFrom) || 0) + i + 1,
+      total: Number(opts.numberTotal) || questions.length,
+      read,
+    });
+    const slides = slidesMode === "both"
+      ? [qSlide, aSlide]
+      : [{ ...qSlide, pauseSec: reveal.pauseSec }, revealSlide(qSlide, q, reveal)];
+    for (const s of slides.filter(Boolean)) { plan.push(s); planQuestions.push(q); }
+  });
+  if (!plan.length) throw new Error("Could not build any slides for this question.");
+
+  // Optional opening title slide and closing call-to-action slide.
+  const slideText = opts.slideText || {};
+  if (opts.intro) {
+    const io = typeof opts.intro === "object" ? opts.intro : {};
+    // The Short's intro is its own (9:16) slide: role "shortintro", own template + text.
+    const introRole = io.role === "shortintro" ? "shortintro" : "intro";
+    const ic = slideText[introRole] || {};
+    const introPlan = introSlidePlan({ subject: io.subject, topic: io.topic, siteName: brandOpts.siteName, narration: ic.narration, showSubject: ic.showSubject, showTopic: ic.showTopic, heading: io.heading, line: io.line, defaultNarration: io.narration });
+    plan.unshift(introRole === "shortintro" ? { ...introPlan, role: "shortintro" } : introPlan);
+    planQuestions.unshift(null);
+  }
+  if (opts.outro) {
+    const kind = opts.outro === "short" ? "short" : "full";
+    plan.push(outroSlidePlan(kind, { siteName: brandOpts.siteName, narration: slideText[kind === "short" ? "shortoutro" : "outro"]?.narration }));
+    planQuestions.push(null);
+  }
+  // Intro / end slides: on-screen time = the admin's seconds, or (0 = auto)
+  // just the narration — never the question time.
+  const ioSeconds = (role) => Math.max(1, Math.min(60, Math.round(Number(slideText[role]?.seconds)) || 1));
+
+  const workDir = await fs.mkdtemp(path.join(os.tmpdir(), "msg-slideshow-"));
+  try {
+    // 2) Render every slide image (branded 9:16 SVG → JPEG on Cloudinary) and
+    //    pull it down locally for ffmpeg.
+    onStatus(SLIDESHOW_STATUS.GENERATING_SLIDES);
+    onProgress(SLIDESHOW_STATUS.GENERATING_SLIDES, 0, plan.length);
+    // Download each template once (if set). A template that can't be fetched
+    // is skipped — that slide type falls back to the built-in design.
+    const templatePaths = {};
+    for (const role of ["question", "answer", "intro", "outro", "shortintro", "shortoutro"]) {
+      if (!templates[role]) continue;
+      const p = path.join(workDir, `template-${role}`);
+      try { await downloadTo(templates[role], p); templatePaths[role] = p; } catch { /* use built-in design */ }
+    }
+    // Template sizes, so the slide can place its card inside the template as
+    // it's actually shown (fitted, never cropped — see composeSlideshowMp4).
+    const templateSizes = {};
+    // A template within 5% of the frame's shape (e.g. 1536×1024 or 1920×1080 for
+    // 16:9) FILLS the frame — no blurred bars. Its size is then not sent to the
+    // slide page, so the card is placed on the full frame, exactly as it's drawn.
+    const templateFill = {};
+    const frameRatio = landscape ? 16 / 9 : 9 / 16;
+    for (const role of Object.keys(templatePaths)) {
+      const size = await probeImageSize(templatePaths[role]).catch(() => null);
+      const fill = !!(size?.width > 0 && size?.height > 0 && Math.abs(size.width / size.height / frameRatio - 1) <= 0.05);
+      templateFill[role] = fill;
+      templateSizes[role] = fill ? null : size;
+    }
+    // First choice: screenshot the real student-view components (Inter font,
+    // KaTeX math, same option / answer cards as posts and Reels) — one browser
+    // for every slide, PNGs written straight into workDir.
+    const shotPaths = plan.map((_, i) => path.join(workDir, `shot${String(i).padStart(2, "0")}.png`));
+    const shots = await renderSlideCardShots(
+      plan.map((s, i) => ({
+        questionId: planQuestions[i]?._id ? String(planQuestions[i]._id) : (IO_ROLES.includes(s.role) ? s.role : ""),
+        role: s.role,
+        heading: s.heading || "",
+        lines: s.lines || [],
+        tag: s.tag,
+        caption: brandOpts.autoCaptions ? (s.caption || (IO_ROLES.includes(s.role) ? stripNarrationPauses(s.narration) : s.narration)) : "",
+        template: !!templatePaths[templateRole(s.role)],
+        templateSize: templateSizes[templateRole(s.role)] || null,
+        templateInset,
+        // Only the question / answer templates use the card box (intro / end
+        // slides have their own text-box editor).
+        cardBox: ["question", "answer"].includes(templateRole(s.role)) ? cardBox : "",
+        logos: ["question", "answer"].includes(templateRole(s.role)) ? cardLogos : [],
+        outPath: shotPaths[i],
+      })),
+      { siteUrl: brandOpts.siteUrl, landscape, brand: { name: brandOpts.brandName, logoUrl: brandOpts.brandLogoUrl, color: brandOpts.brandColor } }
+    ).catch((e) => plan.map(() => ({ error: e?.message || String(e) })));
+    // Slides that couldn't be screenshotted fall back to the basic SVG design —
+    // report WHICH and WHY (returned to the admin with the video).
+    const fallbackSlides = [];
+    shots.forEach((r, i) => {
+      if (r?.ok) return;
+      fallbackSlides.push({ slide: i + 1, role: plan[i].role, tag: plan[i].tag, error: r?.error || "unknown error" });
+    });
+    if (fallbackSlides.length) {
+      console.warn(`[slideshow] ${fallbackSlides.length}/${plan.length} slides use the basic design: ` +
+        fallbackSlides.map((f) => `#${f.slide} ${f.error}`).join(" | "));
+    }
+
+    // Intro / end / Short-end slides with their OWN uploaded template + text
+    // box render through the thumbnail engine (draggable box, full styling),
+    // exactly like the thumbnail. Best-effort — falls back to the screenshot.
+    const preRendered = {};
+    if (opts.slideText) {
+      for (let i = 0; i < plan.length; i++) {
+        const s = plan[i];
+        const cfg = IO_ROLES.includes(s.role) ? opts.slideText[s.role] : null;
+        // "Write the text on it" OFF → show the uploaded template ALONE (a
+        // transparent layer on top) — no card, heading or caption.
+        if (cfg && cfg.showText === false && templatePaths[templateRole(s.role)]) {
+          const fp = path.join(workDir, `slideblank${String(i).padStart(2, "0")}.png`);
+          await fs.writeFile(fp, TRANSPARENT_PNG);
+          preRendered[i] = fp;
+          continue;
+        }
+        // Only the movable-box mode renders here; "fixed" slides fall through to
+        // the built-in centred layout (screenshot) on their template.
+        if (!cfg?.templateUrl || cfg.showText === false || !cfg.useBox) continue;
+        try {
+          const { renderYoutubeThumbnail } = await import("./ytThumbnail.js");
+          const r = await renderYoutubeThumbnail({
+            ...cfg,
+            width: landscape ? 1920 : 1080,
+            height: landscape ? 1080 : 1920,
+            lines: { kicker: "", headline: s.heading || "", badge: (s.lines || []).join(" · ") },
+            brandColor: brandOpts.brandColor,
+          });
+          if (r.image) {
+            const fp = path.join(workDir, `slidebox${String(i).padStart(2, "0")}.jpg`);
+            await fs.writeFile(fp, r.image);
+            preRendered[i] = fp;
+          }
+        } catch { /* fall back to the normal slide render */ }
+      }
+    }
+
+    const imagePaths = [];
+    for (let i = 0; i < plan.length; i++) {
+      if (preRendered[i]) {
+        imagePaths.push(preRendered[i]);
+      } else if (shots[i]?.ok) {
+        imagePaths.push(shotPaths[i]);
+      } else {
+        // Fallback: the lightweight SVG slide (never blocks the video).
+        const withTemplate = !!templatePaths[templateRole(plan[i].role)];
+        const img = await renderSlideImage(plan[i], { ...brandOpts, transparentBackground: withTemplate });
+        const p = path.join(workDir, `slide${String(i).padStart(2, "0")}.${withTemplate ? "png" : "jpg"}`);
+        await downloadTo(img.url, p);
+        imagePaths.push(p);
+      }
+      onProgress(SLIDESHOW_STATUS.GENERATING_SLIDES, i + 1, plan.length);
+    }
+
+    // 3) Narrate every slide. Split PER SLIDE (never one giant request) so each
+    //    slide is timed to its own narration.
+    onStatus(SLIDESHOW_STATUS.GENERATING_AUDIO);
+    onProgress(SLIDESHOW_STATUS.GENERATING_AUDIO, 0, plan.length);
+    const audioPaths = [];
+    for (let i = 0; i < plan.length; i++) {
+      // A silent slide (e.g. the green reveal with "say" off) gets no audio;
+      // the composer fills its time with silence.
+      if (!String(plan[i].narration || "").trim()) {
+        audioPaths.push(null);
+        onProgress(SLIDESHOW_STATUS.GENERATING_AUDIO, i + 1, plan.length);
+        continue;
+      }
+      // Intro / end slides may carry pause marks ("[pause]", "[pause 2]") →
+      // real silences between the words (only there — question text is never
+      // scanned, so a "[2]" in a question is read as written).
+      // Also a question slide whose plan added its own pauses (journal / ledger options).
+      if ((IO_ROLES.includes(plan[i].role) || plan[i].pauses) && hasNarrationPauses(plan[i].narration)) {
+        try {
+          audioPaths.push(await synthesizeWithPauses({ text: plan[i].narration, voice, cfg: ttsCfg, workDir, name: `audio${String(i).padStart(2, "0")}` }));
+        } catch (e) {
+          throw new Error(`Narration failed on slide ${i + 1} (${ttsCfg.provider}): ${e?.message || e}`);
+        }
+        onProgress(SLIDESHOW_STATUS.GENERATING_AUDIO, i + 1, plan.length);
+        continue;
+      }
+      let result;
+      try {
+        result = await synthesizeLongSpeech({ text: plan[i].narration, voice, cfg: ttsCfg });
+      } catch (e) {
+        throw new Error(`Narration failed on slide ${i + 1} (${ttsCfg.provider}): ${e?.message || e}`);
+      }
+      const p = path.join(workDir, `audio${String(i).padStart(2, "0")}.mp3`);
+      await fs.writeFile(p, result.buffer);
+      audioPaths.push(p);
+      onProgress(SLIDESHOW_STATUS.GENERATING_AUDIO, i + 1, plan.length);
+    }
+
+    // 4) Compose the MP4 locally (each slide lasts as long as its narration),
+    //    then host ONE plain video file on Cloudinary for Meta to fetch.
+    onStatus(SLIDESHOW_STATUS.RENDERING_VIDEO);
+    onProgress(SLIDESHOW_STATUS.RENDERING_VIDEO, 0, plan.length);
+    const outPath = path.join(workDir, "slideshow.mp4");
+    const { duration, segmentDurations = [] } = await composeSlideshowMp4({
+      ...(landscape ? { width: 1920, height: 1080, maxTotalSec: Infinity } : {}),
+      // A vertical YouTube Short may run up to 3 min (not the 90 s Reel limit).
+      ...(!landscape && Number(opts.maxTotalSec) > 0 ? { maxTotalSec: Number(opts.maxTotalSec) } : {}),
+      // Slide 1 stays up for the question time, slide 2 for the answer time —
+      // or longer when the narration needs it (the voice is never cut off).
+      // The reveal slide shows for its own time; the question slide before it
+      // adds the thinking pause AFTER its narration.
+      slides: plan.map((s, i) => ({
+        imagePath: imagePaths[i],
+        audioPath: audioPaths[i],
+        minSec: s.role === "reveal" ? s.minSec
+          : s.role === "answer" ? answerSec
+          : IO_ROLES.includes(s.role) ? ioSeconds(s.role)
+          : questionSec,
+        pauseSec: s.pauseSec || 0,
+        bgPath: templatePaths[templateRole(s.role)] || null,
+        bgFill: !!templateFill[templateRole(s.role)],
+      })),
+      outPath,
+      workDir,
+      templateInset,
+      onProgress: (done, total) => onProgress(SLIDESHOW_STATUS.RENDERING_VIDEO, done, total),
+    });
+    // Start time of each question in the video (YouTube chapters).
+    const chapters = [];
+    let at = 0;
+    plan.forEach((s, i) => {
+      const qi = questions.indexOf(planQuestions[i]);
+      if (qi >= 0 && !chapters[qi]) chapters[qi] = { question: qi + 1, startSec: at };
+      at += Number(segmentDurations[i]) || 0;
+    });
+
+    let uploaded = null;
+    let filePath = "";
+    if (keepFile) {
+      // Move the MP4 out of the temp dir (which is wiped below); the caller
+      // uploads it and then deletes it.
+      filePath = path.join(os.tmpdir(), `msg-longvideo-${Date.now()}-${Math.random().toString(36).slice(2, 8)}.mp4`);
+      await fs.rename(outPath, filePath).catch(async () => { await fs.copyFile(outPath, filePath); });
+    } else {
+      uploaded = await uploadFileToCloudinary(outPath, {
+        resourceType: "video",
+        folder: "postme/slideshow/final",
+      });
+      if (!uploaded?.secure_url) throw new Error("Cloudinary did not return a URL for the slideshow video.");
+    }
+
+    onStatus(SLIDESHOW_STATUS.READY);
+    const steps = stepMarks.slice(0, -1).map(([st, at], i) => `${st} ${Math.round((stepMarks[i + 1][1] - at) / 1000)}s`);
+    console.log(`[slideshow] ${plan.length} slides in ${Math.round((Date.now() - stepMarks[0][1]) / 1000)}s — ${steps.join(", ")}`);
+    return {
+      videoUrl: uploaded?.secure_url || "",
+      filePath, // set when keepFile — the caller must delete it
+      chapters: chapters.filter(Boolean),
+      slides: plan.length,
+      questions: questions.length,
+      duration: Math.round(Number(uploaded?.duration) || duration || 0),
+      voice,
+      provider: ttsCfg.provider,
+      ttsNote, // set when the chosen voice's provider was blocked and another was used
+      slidePlan: plan.map((s) => ({ id: s.id, tag: s.tag })),
+      slidesMode,
+      // Slides drawn with the basic design instead of the student view: [{ slide, role, tag, error }].
+      fallbackSlides,
+    };
+  } finally {
+    // Always clean up the temp files (images, audio, segments, final MP4).
+    await fs.rm(workDir, { recursive: true, force: true }).catch(() => {});
+  }
+}

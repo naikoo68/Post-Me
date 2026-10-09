@@ -1,0 +1,738 @@
+import { activeSocialProfileId, runAsSocialProfile } from "../utils/socialProfile.js";
+import { cleanBrandName, cleanBrandLogoUrl, cleanBrandWebsite } from "../utils/videoBrand.js";
+import { cleanCardBox } from "../utils/cardBox.js";
+import { cleanVideoText } from "../utils/videoDescription.js";
+import Settings from "../models/Settings.js";
+import { cleanTgChat, verifyTelegram, sendTelegramMessage, findTelegramChats, isTgInviteLink, TG_INVITE_HELP } from "../config/telegram.js";
+import Tenant from "../models/Tenant.js";
+import { getCurrentTenantId, runUnscoped } from "../utils/tenantContext.js";
+import { postToFacebookPage, verifyFacebook, getFacebookConfig, getInstagramUserId, postToInstagram, invalidateTokenScopeCache } from "../config/facebook.js";
+import { renderQuestionImage } from "../config/socialImage.js";
+import { uploadToCloudinary } from "../config/cloudinary.js";
+import { toInstagramSafeUrl } from "../utils/instagramImage.js";
+import { publicLogoUrl, apiOriginFromRequest } from "../utils/logoUrl.js";
+import { isSafePublicUrl } from "../utils/urlGuard.js";
+import { normalizeTextBox } from "../config/youtube.js";
+import { TTS_PROVIDERS, DEFAULT_TTS_PROVIDER, TTS_KEY_FIELDS } from "../utils/ttsVoices.js";
+import { isSafeProviderUrl } from "../utils/urlGuard.js";
+
+// A freshly-provisioned institute must start as a CLEAN SLATE — it should carry
+// only its own name, never the platform's demo branding, marketing copy, fake
+// testimonials/stats or contact details. We pass these fields explicitly (empty)
+// so Mongoose does NOT fall back to the schema defaults ("My Study Guide", the
+// sample toppers, "1,20,000+ students", hello@mystudyguide.com, …). Functional
+// defaults (colours, nav sizing, watermark, subscription plans) are left to the
+// schema so the institute still has sensible, working settings.
+export function cleanTenantSeed(instituteName) {
+  return {
+    key: "site",
+    siteName: instituteName || "",
+    tagline: "",
+    aboutHeading: "",
+    aboutIntro: "",
+    aboutValues: [],
+    aboutStats: [],
+    testimonials: [],
+    contacts: [],
+    socialLinks: [],
+  };
+}
+
+// Fetch this scope's settings, creating the doc on first access. For a NON-default
+// institute the new doc is seeded empty (its own name only); the default/platform
+// tenant keeps the full demo defaults so nothing about the main site changes.
+// Resolve THIS site's settings document DETERMINISTICALLY. A multi-tenant setup
+// (and non-Mongo engines where query auto-scoping doesn't run) can hold several
+// {key:"site"} docs. A bare `findOne({key:"site"})` returns an ARBITRARY one —
+// which is exactly why on Oracle the public site picked up a different
+// institute's (near-empty) settings, so branding, social links, contacts,
+// platform statistics and the home layout all went missing. Here we pick the
+// right doc explicitly: current tenant → default tenant → tenant-less → any.
+// A cross-posting user's own settings doc (X-Social-Profile header). Throws
+// when the id isn't a profile of this institute, so a bad id can NEVER fall
+// through to — and edit — the main site's settings.
+async function findActiveProfileDoc() {
+  const pid = activeSocialProfileId();
+  if (!pid) return null;
+  const doc = await Settings.findOne({ _id: pid, socialProfile: true });
+  if (!doc) { const e = new Error("Cross-posting user not found."); e.status = 404; throw e; }
+  return doc;
+}
+
+async function findSite() {
+  const profile = await findActiveProfileDoc();
+  if (profile) return profile;
+  const tenantId = getCurrentTenantId();
+  if (tenantId) {
+    const s = await Settings.findOne({ key: "site", tenantId });
+    if (s) return s;
+  }
+  const def = await Tenant.findOne({ isDefault: true }).select("_id").lean();
+  if (def) {
+    const s = await Settings.findOne({ key: "site", tenantId: def._id });
+    if (s) return s;
+  }
+  const legacy = await Settings.findOne({ key: "site", tenantId: null });
+  if (legacy) return legacy;
+  return Settings.findOne({ key: "site" });
+}
+
+async function getOrCreate() {
+  const existing = await findSite();
+  if (existing) return existing;
+  const tenantId = getCurrentTenantId();
+  if (tenantId) {
+    const t = await Tenant.findById(tenantId).select("name isDefault").lean();
+    if (t && !t.isDefault) return Settings.create(cleanTenantSeed(t.name));
+  }
+  return Settings.create({ key: "site" });
+}
+
+// The settings doc that WRITES must target: strictly the CURRENT tenant's OWN
+// doc. findSite()/getOrCreate() fall back to the default/legacy doc for READS
+// (so a public visitor still sees platform branding), but a write must never
+// land on — or be scoped away from — another tenant's doc.
+//
+// Why this matters: PUT /settings used to capture getOrCreate() (which could
+// return the DEFAULT tenant's doc for an institute with no doc yet) and then
+// findByIdAndUpdate(that._id, …). The tenantId plugin forces tenantId=current
+// on writes, so the _id matched but the tenant didn't → the update silently
+// hit 0 rows and was LOST. That's why an institute admin's onboardingCompleted
+// (and other saves) never stuck and the setup wizard kept returning. We now
+// resolve/create the caller's OWN doc and save() it, which the plugin stamps to
+// the right tenant instead of filtering away.
+export async function getOrCreateOwn() {
+  const profile = await findActiveProfileDoc();
+  if (profile) return profile;
+  const tenantId = getCurrentTenantId();
+  if (tenantId) {
+    const mine = await Settings.findOne({ key: "site", tenantId });
+    if (mine) return mine;
+    const t = await Tenant.findById(tenantId).select("name isDefault").lean();
+    // A real institute starts from a clean seed; the platform/default tenant
+    // keeps the full schema defaults.
+    return Settings.create(t && !t.isDefault ? cleanTenantSeed(t.name) : { key: "site" });
+  }
+  // No tenant context (super-admin unscoped / single-tenant): use the normal
+  // resolver, creating a default doc if needed.
+  return getOrCreate();
+}
+
+// Never send the Facebook access token to the browser. Replace it with a
+// boolean (fbTokenSet) so the admin UI can show "saved" without exposing it.
+function safeSettings(s) {
+  const obj = s && s.toObject ? s.toObject() : { ...(s || {}) };
+  obj.fbTokenSet = !!obj.fbPageAccessToken;
+  delete obj.fbPageAccessToken;
+  obj.tgBotTokenSet = !!obj.tgBotToken;
+  delete obj.tgBotToken;
+  // TTS narration API key (AI Slideshow) — never send the raw key to the
+  // browser; expose a boolean so the UI can show "key saved".
+  // Same for every paid engine's key (ttsApiKey → ttsApiKeySet, …).
+  for (const f of Object.values(TTS_KEY_FIELDS)) {
+    obj[`${f}Set`] = !!obj[f];
+    delete obj[f];
+  }
+  // YouTube: never send the OAuth refresh token or client secret to the browser.
+  obj.ytConnected = !!obj.ytRefreshToken;
+  obj.ytClientSecretSet = !!obj.ytClientSecret;
+  delete obj.ytRefreshToken;
+  delete obj.ytClientSecret;
+  // Extra cross-post pages: never send their tokens to the browser.
+  if (Array.isArray(obj.fbExtraTargets)) {
+    obj.fbExtraTargets = obj.fbExtraTargets.map((t) => ({ label: t.label || "", pageId: t.pageId || "", tokenSet: !!t.token }));
+  }
+  return obj;
+}
+
+// GET /api/settings — public (frontend reads this to brand/theme itself)
+export async function getSettings(req, res) {
+  // GET /settings is public; a cross-posting user's settings are admin-only.
+  if (activeSocialProfileId() && req.user?.role !== "admin") {
+    return runAsSocialProfile("", () => getSettings(req, res));
+  }
+  const doc = await getOrCreate();
+  // SELF-HEAL a logo corrupted by the old round-trip bug. That bug could store
+  // the logo as its OWN /api/settings/logo proxy URL — a self-referential link
+  // that getLogo must 404 (it can't redirect to itself), so the logo renders as
+  // a permanently BROKEN image (the <img> alt text shows) until someone
+  // re-uploads. If we detect that corrupted value here, clear it: the UI then
+  // falls back to the default icon and the bad value is gone for good. The
+  // original base64 is unrecoverable (the bug overwrote it), so a fresh upload
+  // is still needed to set a logo — but it now saves and sticks cleanly. This
+  // only fires for the corrupted pattern, so healthy logos are untouched, and
+  // once cleared the condition never matches again (a one-time write).
+  if (doc?.logoUrl && /\/api\/settings\/logo(\?|$)/i.test(String(doc.logoUrl))) {
+    doc.logoUrl = "";
+    runUnscoped(() => Settings.updateOne({ _id: doc._id }, { $set: { logoUrl: "" } })).catch(() => {});
+  }
+  const s = safeSettings(doc);
+  // A base64 logo can be hundreds of KB. Shipping it inline here — on a payload
+  // the frontend fetches on EVERY page load — was a major mobile slowdown.
+  // Replace an inline logo with a cacheable /api/settings/logo URL so the heavy
+  // bytes are fetched once and cached, and the settings JSON stays small.
+  // (A logo already stored as a normal URL is left untouched.)
+  if (s.logoUrl) {
+    const version = s.updatedAt ? new Date(s.updatedAt).getTime() : 1;
+    s.logoUrl = publicLogoUrl(s.logoUrl, {
+      origin: apiOriginFromRequest(req),
+      version,
+      tenantId: getCurrentTenantId() || "",
+    });
+  }
+  // Tell the frontend whether this is the platform (default) site or an
+  // institute's own site. Used to hide the "Institute" sign-up/login option on
+  // an institute site (registering a NEW institute belongs only on the platform
+  // site; Student and Creator still belong on an institute site).
+  s.isDefaultTenant = !req.tenant || req.tenant.isDefault === true;
+  // The platform root domain (when subdomains are configured), so the frontend
+  // can build clean per-institute URLs (slug.rootDomain) instead of ?t=slug.
+  s.rootDomain = (process.env.ROOT_DOMAIN || "").replace(/^\./, "").toLowerCase();
+  res.json(s);
+}
+
+// GET /api/settings/logo — serve the site logo as a real, cacheable image so it
+// does NOT bloat the /api/settings JSON (see getSettings). Public: <img>, the
+// favicon and the PWA manifest all reference it, none of which send auth or the
+// tenant host header — so the tenant is taken from the ?t= query (added by
+// getSettings), falling back to the default/platform site's logo.
+export async function getLogo(req, res) {
+  try {
+    const tid = String(req.query.t || "").trim();
+    const readLogo = async (filter) =>
+      runUnscoped(() => Settings.findOne(filter).select("logoUrl").lean());
+    const hasLogo = (d) => !!String(d?.logoUrl || "").trim();
+
+    // Resolve the logo the SAME way findSite() resolves the settings doc, so
+    // getLogo can always find whatever getSettings turned into this proxy URL.
+    // Previously getLogo stopped at the default tenant and had NO fallback to a
+    // null-tenant (legacy / tenant-enforcement-off) or any-site doc — so a logo
+    // stored on a null-tenant doc (the normal case when enforcement is OFF)
+    // produced a 404 and a permanently BROKEN logo, even though getSettings
+    // happily served its proxy URL. Order: requested tenant → default tenant →
+    // null-tenant/legacy → any site doc that actually has a logo.
+    let doc = tid ? await readLogo({ key: "site", tenantId: tid }) : null;
+    if (!hasLogo(doc)) {
+      const def = await runUnscoped(() => Tenant.findOne({ isDefault: true }).select("_id").lean());
+      if (def) doc = await readLogo({ key: "site", tenantId: def._id });
+    }
+    if (!hasLogo(doc)) doc = await readLogo({ key: "site", tenantId: null }); // legacy / enforcement OFF
+    if (!hasLogo(doc)) doc = await readLogo({ key: "site" });                  // last resort: any site doc
+    const logo = String(doc?.logoUrl || "").trim();
+    if (!logo) return res.status(404).end();
+    // Guard against a logo that was accidentally saved as this very endpoint's
+    // URL (an older round-trip bug): redirecting would loop forever. Treat it as
+    // "no logo" so the UI falls back to the default icon.
+    if (/\/api\/settings\/logo(\?|$)/i.test(logo)) return res.status(404).end();
+    // An externally-hosted logo: just redirect to it.
+    if (/^https?:\/\//i.test(logo)) return res.redirect(302, logo);
+    // A base64 data URI: decode and stream it as a cacheable image.
+    const m = /^data:([^;]+);base64,(.*)$/s.exec(logo);
+    if (!m) return res.status(404).end();
+    const buf = Buffer.from(m[2], "base64");
+    res.set("Content-Type", m[1] || "image/png");
+    // Cache for a day; the URL carries ?v=<updatedAt> so a logo change busts it.
+    res.set("Cache-Control", "public, max-age=86400");
+    return res.end(buf);
+  } catch {
+    return res.status(404).end();
+  }
+}
+
+// PUT /api/settings — admin only
+export async function updateSettings(req, res) {
+  // Resolve THIS caller's OWN settings doc (created clean-seeded if it doesn't
+  // exist yet). Using getOrCreateOwn — NOT getOrCreate — is what makes an
+  // institute admin's save land on their own doc instead of silently hitting 0
+  // rows on the default tenant's doc (see getOrCreateOwn's note).
+  const site = await getOrCreateOwn();
+
+  const allowed = [
+    "siteName", "tagline", "logoUrl", "primaryColor", "accentColor",
+    "heroBadge", "heroTitle", "heroSubtitle",
+    "fontFamily", "socialLinks", "contacts",
+    "navHeight", "navBrandSize", "navFontSize", "navFontWeight", "navFontFamily", "navTextTransform", "defaultZoom",
+    "watermarkEnabled", "watermarkText", "watermarkOpacity", "watermarkSize", "watermarkMode", "restrictCopy", "screenshotGuard", "guardHoldMs", "statsAuto", "notifyOnNewContent", "notifyExpiryDays",
+    "publicClientEnabled", "publicInstituteEnabled",
+    "studentPlansEnabled", "creatorPlansEnabled", "institutePlansEnabled",
+    "featureFlags", "publicFeatureFlags",
+    "homeSections",
+    "clientAnnouncement",
+    "onboardingCompleted", "onboardingDismissed",
+    "privacyPolicy", "termsOfService", "refundPolicy",
+    "aboutHeading", "aboutIntro", "aboutValues", "aboutStats", "testimonials", "faqs",
+    "aiMaxPerBatch", "clientPlans", "studentPlans", "tenantPlans",
+    "fbEnabled", "fbPageId", "fbAutoOnNotice", "fbGraphVersion", "fbPageAccessToken",
+    "tgEnabled", "tgBotToken", "tgChatId", "socialLinksOnYoutube", "socialLinksComment",
+    "videoDescriptionText", "videoDescriptionYoutube", "videoDescriptionFacebook",
+    "fbDefaultHashtags", "fbAutoHashtags", "fbExtraTargets",
+    "fbSelfieWatermarkUrl", "fbSelfieWatermarkEnabled", "fbSelfieWatermarkPosition", "fbSelfieWatermarkSize", "fbSelfieWatermarkOpacity", "fbSelfieWatermarkShape",
+    "fbTextWatermarkEnabled", "fbTextWatermarkText", "fbTextWatermarkSize", "fbTextWatermarkOpacity",
+    "fbFlashcardTemplateUrl", "fbFlashcardTemplateEnabled",
+    "videoBrandName", "videoBrandLogoUrl", "videoBrandWebsite", "videoBrandColor",
+    "slideshowCardBox", "longVideoCardBox",
+    "fbReelAudios",
+    "fbAutoCommentEnabled", "fbAutoComment",
+    "fbNotifyEmail", "fbNotifyOnPost", "fbNotifyOnError", "fbNotifyOnComplete",
+    "fbAutoComments", "fbAutoCommentMode", "fbAutoCommentToFacebook", "fbAutoCommentToInstagram",
+    "igAutoComments", "linkInBioText",
+    "igEnabled", "igUserId",
+    "ttsProvider", "ttsApiKey", "ttsModel",
+    "ttsElevenLabsKey", "ttsElevenLabsModel", "ttsGoogleCloudKey", "ttsAzureKey", "ttsAzureRegion",
+    "ttsCustomUrl", "ttsCustomKey", "ttsCustomModel",
+    "slideshowQuestionSec", "slideshowAnswerSec", "slideshowVoice", "slideshowAutoCaptions",
+    "slideshowSlides", "slideshowRevealPauseSec", "slideshowRevealSec", "slideshowRevealSay",
+    "slideshowReadQuestion", "slideshowReadOptions", "slideshowReadExplanation", "slideshowReadKeyPoints", "slideshowReadQuickRecall",
+    "slideshowQuestionTemplateUrl", "slideshowAnswerTemplateUrl",
+    "longVideoQuestionTemplateUrl", "longVideoAnswerTemplateUrl",
+    "longVideoIntroTemplateUrl", "longVideoOutroTemplateUrl", "longVideoShortOutroTemplateUrl",
+    "longVideoIntroText", "longVideoOutroText", "longVideoShortOutroText",
+    "googleClientId",
+  ];
+  const update = {};
+  for (const k of allowed) if (k in req.body) update[k] = req.body[k];
+  // Video branding is drawn on slides and passed in a screenshot URL — keep it clean.
+  for (const k of ["slideshowCardBox", "longVideoCardBox"]) if (k in update) update[k] = cleanCardBox(update[k]);
+  if ("videoBrandName" in update) update.videoBrandName = cleanBrandName(update.videoBrandName);
+  if ("videoBrandLogoUrl" in update) update.videoBrandLogoUrl = cleanBrandLogoUrl(update.videoBrandLogoUrl);
+  if ("videoBrandWebsite" in update) update.videoBrandWebsite = cleanBrandWebsite(update.videoBrandWebsite);
+  if ("videoBrandColor" in update) update.videoBrandColor = /^#[0-9a-f]{6}$/i.test(String(update.videoBrandColor || "")) ? String(update.videoBrandColor).toLowerCase() : "";
+
+  // LOGO GUARD. The browser receives the logo as a cacheable /api/settings/logo
+  // PROXY URL (see getSettings — the heavy base64 is stripped out of the JSON).
+  // When the admin just saves the Customization form without touching the logo,
+  // that proxy URL is submitted back here. Writing it would REPLACE the real
+  // (base64/hosted) logo with a self-referential link that 302-redirects to
+  // itself — an infinite loop that breaks the logo everywhere. So if the
+  // incoming logoUrl points at our own logo endpoint, drop it and keep the
+  // stored logo untouched. (A genuine new upload is a data: URI or an external
+  // URL, which is saved normally.)
+  if ("logoUrl" in update && /\/api\/settings\/logo(\?|$)/i.test(String(update.logoUrl || ""))) {
+    delete update.logoUrl;
+  }
+
+  // Facebook: keep the token server-side. Only overwrite it when a NEW non-empty
+  // value is provided (the admin UI submits it blank to keep the saved one).
+  // Also drop the granted-scope cache so a freshly authorised token isn't
+  // held back by the previous token's "missing scope" verdict.
+  // Telegram: a blank token keeps the saved one; the chat is normalised (@name / -100…).
+  if ("tgBotToken" in update) {
+    const t = String(update.tgBotToken || "").trim();
+    if (t) update.tgBotToken = t; else delete update.tgBotToken;
+  }
+  if ("tgChatId" in update) {
+    if (isTgInviteLink(update.tgChatId)) {
+      const e = new Error(TG_INVITE_HELP); e.status = 400; throw e;
+    }
+    update.tgChatId = cleanTgChat(update.tgChatId) || String(update.tgChatId || "").trim().slice(0, 100);
+  }
+  if ("fbPageAccessToken" in update) {
+    const tok = String(update.fbPageAccessToken || "").trim();
+    if (tok) { update.fbPageAccessToken = tok; invalidateTokenScopeCache(); } else delete update.fbPageAccessToken;
+  }
+  if ("fbPageId" in update) update.fbPageId = String(update.fbPageId || "").trim();
+
+  // AI Slideshow TTS: validate the provider, and keep the API key server-side —
+  // only overwrite it when a NEW non-empty value is provided (the UI submits it
+  // blank to keep the saved one, same as the Facebook token).
+  if ("ttsProvider" in update) {
+    // Validate against the shared provider list (gtranslate / edge / openai).
+    // (It used to allow only edge/openai, so choosing the Google engine and
+    // saving silently stored "edge" instead.)
+    const p = String(update.ttsProvider || "").trim().toLowerCase();
+    update.ttsProvider = TTS_PROVIDERS.includes(p) ? p : DEFAULT_TTS_PROVIDER;
+  }
+  if ("ttsModel" in update) update.ttsModel = String(update.ttsModel || "").trim().slice(0, 120);
+  // AI Slideshow: slide times 3–40 s; voice is a short id (normalised against
+  // the active engine at render time); captions a boolean.
+  const slideSec = (v, def) => { const n = Math.round(Number(v)); return Number.isFinite(n) && n > 0 ? Math.max(3, Math.min(40, n)) : def; };
+  if ("slideshowQuestionSec" in update) update.slideshowQuestionSec = slideSec(update.slideshowQuestionSec, 10);
+  if ("slideshowAnswerSec" in update) update.slideshowAnswerSec = slideSec(update.slideshowAnswerSec, 8);
+  if ("videoDescriptionText" in update) update.videoDescriptionText = cleanVideoText(update.videoDescriptionText);
+  for (const k of ["videoDescriptionYoutube", "videoDescriptionFacebook"]) if (k in update) update[k] = update[k] !== false;
+  if ("slideshowVoice" in update) update.slideshowVoice = String(update.slideshowVoice || "").trim().slice(0, 60);
+  if ("slideshowAutoCaptions" in update) update.slideshowAutoCaptions = !!update.slideshowAutoCaptions;
+  if ("slideshowSlides" in update) update.slideshowSlides = update.slideshowSlides === "question" ? "question" : "both";
+  const clampSec = (v, def, lo, hi) => { const n = Math.round(Number(v)); return Number.isFinite(n) ? Math.max(lo, Math.min(hi, n)) : def; };
+  if ("slideshowRevealPauseSec" in update) update.slideshowRevealPauseSec = clampSec(update.slideshowRevealPauseSec, 3, 0, 15);
+  if ("slideshowRevealSec" in update) update.slideshowRevealSec = clampSec(update.slideshowRevealSec, 3, 1, 15);
+  if ("slideshowRevealSay" in update) update.slideshowRevealSay = update.slideshowRevealSay !== false;
+  for (const k of ["slideshowReadQuestion", "slideshowReadOptions", "slideshowReadExplanation", "slideshowReadKeyPoints", "slideshowReadQuickRecall"]) {
+    if (k in update) update[k] = update[k] !== false;
+  }
+  // Slide templates: only safe public http(s) image URLs (from the uploader); "" clears.
+  for (const k of ["longVideoIntroText", "longVideoOutroText", "longVideoShortOutroText"]) {
+    if (k in update) update[k] = update[k] && typeof update[k] === "object" ? normalizeTextBox(update[k]) : null;
+  }
+  for (const k of ["slideshowQuestionTemplateUrl", "slideshowAnswerTemplateUrl", "longVideoQuestionTemplateUrl", "longVideoAnswerTemplateUrl", "longVideoIntroTemplateUrl", "longVideoOutroTemplateUrl", "longVideoShortOutroTemplateUrl"]) {
+    if (k in update) {
+      const u = String(update[k] || "").trim();
+      update[k] = u && /^https?:\/\//i.test(u) && isSafePublicUrl(u) ? u : "";
+    }
+  }
+  // Paid TTS keys: blank = keep the saved key; "__CLEAR__" = remove it.
+  for (const f of Object.values(TTS_KEY_FIELDS)) {
+    if (!(f in update)) continue;
+    const k = String(update[f] || "").trim();
+    if (k === "__CLEAR__") update[f] = "";
+    else if (k) update[f] = k.slice(0, 500);
+    else delete update[f];
+  }
+  for (const f of ["ttsElevenLabsModel", "ttsCustomModel"]) {
+    if (f in update) update[f] = String(update[f] || "").trim().slice(0, 120);
+  }
+  if ("ttsAzureRegion" in update) {
+    update.ttsAzureRegion = String(update.ttsAzureRegion || "").trim().toLowerCase().replace(/[^a-z0-9]/g, "").slice(0, 40);
+  }
+  if ("ttsCustomUrl" in update) {
+    // Fetched by the server → public https only (no internal / metadata hosts).
+    const u = String(update.ttsCustomUrl || "").trim().replace(/\/+$/, "");
+    if (u && !isSafeProviderUrl(u)) {
+      return res.status(400).json({ message: "Custom TTS API URL must be a public https:// address (e.g. https://api.example.com/v1)." });
+    }
+    update.ttsCustomUrl = u;
+  }
+  // Extra cross-post Pages: keep each page's saved token when the UI submits a
+  // blank one (tokens are never sent to the browser, so blank = "unchanged").
+  if (Array.isArray(update.fbExtraTargets)) {
+    const savedTokens = new Map((site.fbExtraTargets || []).map((t) => [String(t.pageId), t.token]));
+    update.fbExtraTargets = update.fbExtraTargets
+      .map((t) => {
+        const pageId = String(t?.pageId || "").trim();
+        const token = String(t?.token || "").trim() || savedTokens.get(pageId) || "";
+        return { label: String(t?.label || "").trim(), pageId, token };
+      })
+      .filter((t) => t.pageId);
+  }
+  if ("fbGraphVersion" in update) update.fbGraphVersion = String(update.fbGraphVersion || "").trim() || "v21.0";
+  if ("igUserId" in update) update.igUserId = String(update.igUserId || "").trim();
+  if ("googleClientId" in update) update.googleClientId = String(update.googleClientId || "").trim();
+
+  // Selfie watermark: validate position and clamp size/opacity.
+  if ("fbSelfieWatermarkUrl" in update) update.fbSelfieWatermarkUrl = String(update.fbSelfieWatermarkUrl || "").trim();
+  if ("fbFlashcardTemplateUrl" in update) update.fbFlashcardTemplateUrl = String(update.fbFlashcardTemplateUrl || "").trim();
+  if ("fbFlashcardTemplateEnabled" in update) update.fbFlashcardTemplateEnabled = !!update.fbFlashcardTemplateEnabled;
+  // Auto first-comment: trim and cap (Facebook/Instagram comment length limit).
+  if ("fbAutoComment" in update) update.fbAutoComment = String(update.fbAutoComment || "").slice(0, 2000);
+  if ("fbAutoCommentEnabled" in update) update.fbAutoCommentEnabled = !!update.fbAutoCommentEnabled;
+  // Shared Reel music library: keep only safe public http(s) URLs, dedupe, cap 30.
+  if ("fbReelAudios" in update) {
+    const arr = Array.isArray(update.fbReelAudios) ? update.fbReelAudios : [];
+    update.fbReelAudios = [...new Set(
+      arr.map((u) => String(u || "").trim())
+        .filter((u) => /^https?:\/\//i.test(u) && isSafePublicUrl(u))
+    )].slice(0, 30);
+  }
+  // Auto-comments: coerce toggles, validate mode, and clean the comment list
+  // (trim, drop blanks, cap each to 2200 chars — the IG comment limit — and the
+  // list to 50). The rotation pointer (fbAutoCommentIndex) is server-managed and
+  // intentionally NOT settable here.
+  if ("fbAutoCommentToFacebook" in update) update.fbAutoCommentToFacebook = !!update.fbAutoCommentToFacebook;
+  if ("fbAutoCommentToInstagram" in update) update.fbAutoCommentToInstagram = !!update.fbAutoCommentToInstagram;
+  if ("fbAutoCommentMode" in update) {
+    const m = String(update.fbAutoCommentMode || "").trim();
+    update.fbAutoCommentMode = ["rotate", "all", "random"].includes(m) ? m : "rotate";
+  }
+  if ("fbAutoComments" in update) {
+    const arr = Array.isArray(update.fbAutoComments) ? update.fbAutoComments : [];
+    update.fbAutoComments = arr
+      .map((c) => String(c || "").trim().slice(0, 2200))
+      .filter(Boolean)
+      .slice(0, 50);
+  }
+  if ("igAutoComments" in update) {
+    const arr = Array.isArray(update.igAutoComments) ? update.igAutoComments : [];
+    update.igAutoComments = arr
+      .map((c) => String(c || "").trim().slice(0, 2200))
+      .filter(Boolean)
+      .slice(0, 50);
+  }
+  if ("linkInBioText" in update) update.linkInBioText = String(update.linkInBioText ?? "").trim().slice(0, 100);
+  // Mentions: a list of @-handles (or Facebook `@[page-id]` tokens) appended
+  // to every auto-comment. Trim, dedupe, cap 30 entries. Add a leading `@` if
+  // the admin forgot it (so `mystudyguide_` becomes `@mystudyguide_`); leave
+  // bracketed Page tags (`@[123]`) untouched.
+  if ("fbAutoCommentMentions" in update) {
+    const arr = Array.isArray(update.fbAutoCommentMentions) ? update.fbAutoCommentMentions : [];
+    const seen = new Set();
+    update.fbAutoCommentMentions = arr
+      .map((m) => {
+        const s = String(m || "").trim();
+        if (!s) return "";
+        if (s.startsWith("@")) return s.slice(0, 200);
+        return `@${s.replace(/^@+/, "")}`.slice(0, 200);
+      })
+      .filter((s) => {
+        if (!s) return false;
+        const k = s.toLowerCase();
+        if (seen.has(k)) return false;
+        seen.add(k);
+        return true;
+      })
+      .slice(0, 30);
+  }
+  if ("fbSelfieWatermarkPosition" in update) {
+    const pos = String(update.fbSelfieWatermarkPosition || "").trim();
+    update.fbSelfieWatermarkPosition = ["bottom-right", "bottom-left", "top-right", "top-left"].includes(pos) ? pos : "bottom-right";
+  }
+  if ("fbSelfieWatermarkSize" in update) update.fbSelfieWatermarkSize = Math.max(40, Math.min(300, parseInt(update.fbSelfieWatermarkSize, 10) || 120));
+  if ("fbSelfieWatermarkOpacity" in update) update.fbSelfieWatermarkOpacity = Math.max(10, Math.min(100, parseInt(update.fbSelfieWatermarkOpacity, 10) || 90));
+  if ("fbSelfieWatermarkShape" in update) {
+    const sh = String(update.fbSelfieWatermarkShape || "").trim();
+    update.fbSelfieWatermarkShape = ["circle", "rectangle"].includes(sh) ? sh : "circle";
+  }
+
+  // Center TEXT watermark: coerce the toggle, trim the text, clamp size/opacity.
+  if ("fbTextWatermarkEnabled" in update) update.fbTextWatermarkEnabled = !!update.fbTextWatermarkEnabled;
+  if ("fbTextWatermarkText" in update) update.fbTextWatermarkText = String(update.fbTextWatermarkText || "").trim().slice(0, 80);
+  if ("fbTextWatermarkSize" in update) update.fbTextWatermarkSize = Math.max(12, Math.min(300, parseInt(update.fbTextWatermarkSize, 10) || 64));
+  if ("fbTextWatermarkOpacity" in update) update.fbTextWatermarkOpacity = Math.max(2, Math.min(100, parseInt(update.fbTextWatermarkOpacity, 10) || 12));
+
+  // Auto-post email notifications: trim the address, coerce the toggles.
+  if ("fbNotifyEmail" in update) update.fbNotifyEmail = String(update.fbNotifyEmail || "").trim().slice(0, 200);
+  if ("fbNotifyOnPost" in update) update.fbNotifyOnPost = !!update.fbNotifyOnPost;
+  if ("fbNotifyOnError" in update) update.fbNotifyOnError = !!update.fbNotifyOnError;
+  if ("fbNotifyOnComplete" in update) update.fbNotifyOnComplete = !!update.fbNotifyOnComplete;
+
+  // Admin-panel feature switches. Accept a flat { key: boolean } map, coerce
+  // every value to a real boolean, and NEVER allow the core always-on features
+  // to be turned off (even if the client sends them as false).
+  if ("featureFlags" in update) {
+    const ALWAYS_ON = new Set(["users", "aiKeys", "storage", "customization"]);
+    const raw = update.featureFlags && typeof update.featureFlags === "object" ? update.featureFlags : {};
+    const clean = {};
+    for (const [k, v] of Object.entries(raw)) {
+      const key = String(k).trim();
+      if (!key || ALWAYS_ON.has(key)) continue;
+      clean[key] = !!v;
+    }
+    update.featureFlags = clean;
+  }
+
+  // Public-site feature switches — same shape, coerced to booleans. (No always-on
+  // exclusions: these only affect what's shown on the public website.)
+  if ("publicFeatureFlags" in update) {
+    const raw = update.publicFeatureFlags && typeof update.publicFeatureFlags === "object" ? update.publicFeatureFlags : {};
+    const clean = {};
+    for (const [k, v] of Object.entries(raw)) {
+      const key = String(k).trim();
+      if (!key) continue;
+      clean[key] = !!v;
+    }
+    update.publicFeatureFlags = clean;
+  }
+
+  // Client welcome popup announcement: coerce enabled + trim/limit text.
+  if ("clientAnnouncement" in update) {
+    const a = update.clientAnnouncement || {};
+    update.clientAnnouncement = {
+      enabled: !!a.enabled,
+      title: String(a.title || "").trim().slice(0, 200),
+      message: String(a.message || "").trim().slice(0, 4000),
+    };
+  }
+
+  // FAQ page content (per audience). Keep only {q,a} strings, trim + cap length,
+  // drop fully-empty rows, and cap the number of questions per audience. An
+  // audience left empty means the front end uses its built-in default FAQs.
+  if ("faqs" in update) {
+    const cleanFaqs = (arr) =>
+      (Array.isArray(arr) ? arr : [])
+        .map((f) => ({ q: String(f?.q || "").trim().slice(0, 300), a: String(f?.a || "").trim().slice(0, 4000) }))
+        .filter((f) => f.q || f.a)
+        .slice(0, 50);
+    const f = update.faqs || {};
+    update.faqs = { student: cleanFaqs(f.student), creator: cleanFaqs(f.creator), institute: cleanFaqs(f.institute) };
+  }
+
+  // AI limits: clamp the admin's global per-batch ceiling.
+  if ("aiMaxPerBatch" in update) {
+    update.aiMaxPerBatch = Math.max(1, Math.min(5000, parseInt(update.aiMaxPerBatch, 10) || 50));
+  }
+  // Client subscription plans: pricing + AI limits. Keys are kept stable
+  // (referenced by user.subscriptionPlan); a missing key is generated from the
+  // label and de-duplicated so each plan stays uniquely addressable.
+  if (Array.isArray(update.clientPlans)) {
+    const usedKeys = new Set();
+    update.clientPlans = update.clientPlans
+      .map((p) => {
+        const label = String(p?.label || "").trim();
+        let base = String(p?.key || "").trim().toLowerCase().replace(/[^a-z0-9]+/g, "").slice(0, 24);
+        if (!base) base = (label.toLowerCase().replace(/[^a-z0-9]+/g, "").slice(0, 20) || "plan");
+        let key = base;
+        let i = 2;
+        while (usedKeys.has(key)) key = `${base}${i++}`;
+        usedKeys.add(key);
+        return {
+          key,
+          label,
+          cycle: String(p?.cycle || "").trim().slice(0, 30),
+          months: Math.max(0, Math.min(120, parseInt(p?.months, 10) || 0)),
+          days: Math.max(0, Math.min(3650, parseInt(p?.days, 10) || 0)),
+          price: Math.max(0, Math.min(10000000, parseInt(p?.price, 10) || 0)),
+          trial: !!p?.trial,
+          maxPerBatch: Math.max(1, Math.min(5000, parseInt(p?.maxPerBatch, 10) || 1)),
+          perWindow: Math.max(1, Math.min(100000, parseInt(p?.perWindow, 10) || 1)),
+          windowMinutes: Math.max(1, Math.min(1440, parseInt(p?.windowMinutes, 10) || 5)),
+        };
+      })
+      .filter((p) => p.label);
+  }
+
+  // Pricing-only plan lists (no AI limits): student + institute plans share the
+  // same normalization — stable/de-duplicated keys, clamped numbers.
+  const normalizePricingPlans = (plans) => {
+    const usedKeys = new Set();
+    return plans
+      .map((p) => {
+        const label = String(p?.label || "").trim();
+        let base = String(p?.key || "").trim().toLowerCase().replace(/[^a-z0-9]+/g, "").slice(0, 24);
+        if (!base) base = (label.toLowerCase().replace(/[^a-z0-9]+/g, "").slice(0, 20) || "plan");
+        let key = base;
+        let i = 2;
+        while (usedKeys.has(key)) key = `${base}${i++}`;
+        usedKeys.add(key);
+        return {
+          key,
+          label,
+          cycle: String(p?.cycle || "").trim().slice(0, 30),
+          months: Math.max(0, Math.min(120, parseInt(p?.months, 10) || 0)),
+          days: Math.max(0, Math.min(3650, parseInt(p?.days, 10) || 0)),
+          price: Math.max(0, Math.min(10000000, parseInt(p?.price, 10) || 0)),
+          trial: !!p?.trial,
+        };
+      })
+      .filter((p) => p.label);
+  };
+  if (Array.isArray(update.studentPlans)) update.studentPlans = normalizePricingPlans(update.studentPlans);
+  if (Array.isArray(update.tenantPlans)) update.tenantPlans = normalizePricingPlans(update.tenantPlans);
+
+  // Make social links absolute so a link pasted without http:// still works.
+  if (Array.isArray(update.socialLinks)) {
+    update.socialLinks = update.socialLinks
+      .filter((s) => s && s.url && s.url.trim() && s.url.trim() !== "#")
+      .map((s) => {
+        const u = s.url.trim();
+        return { platform: s.platform, url: /^https?:\/\//i.test(u) ? u : `https://${u}` };
+      });
+  }
+
+  // Write via the resolved document itself (site is the CURRENT tenant's own
+  // doc). Using .save() means the tenantId plugin keeps/stamps the correct
+  // tenant, instead of a findByIdAndUpdate whose write-scoping could filter the
+  // row out and silently drop the update (the bug that stopped saves sticking).
+  site.set(update);
+  const s = await site.save();
+  res.json(safeSettings(s));
+}
+
+// POST /api/settings/facebook/test — admin: verify the connection and (unless
+// verifyOnly) publish a test post to the configured Facebook Page.
+export async function testFacebookPost(req, res) {
+  const cfg = await getFacebookConfig();
+  if (!cfg.pageId || !cfg.token) {
+    return res.status(400).json({ ok: false, error: "Enter your Page ID and Page access token, click Save, then try again." });
+  }
+  if (req.body?.verifyOnly) {
+    const v = await verifyFacebook(cfg);
+    return res.status(v.ok ? 200 : 502).json(v);
+  }
+  const site = await getOrCreate();
+  const message = String(req.body?.message || "").trim() ||
+    `✅ Test post from ${site.siteName || "Post Me"} — Facebook auto-posting is connected.`;
+  const result = await postToFacebookPage({ message, link: req.body?.link }, cfg);
+  return res.status(result.ok ? 200 : 502).json(result);
+}
+
+// POST /api/settings/telegram/test { verifyOnly?, message? } — admin: check the
+// bot + channel, and (unless verifyOnly) send a test message to the channel.
+// Unsaved values in the body (tgBotToken / tgChatId) are tried first.
+export async function testTelegramPost(req, res) {
+  const site = await getOrCreate();
+  const b = req.body || {};
+  const cfg = { tgBotToken: String(b.tgBotToken || "").trim() || site.tgBotToken, tgChatId: String(b.tgChatId || "").trim() || site.tgChatId };
+  // `message` too — the admin UI shows err.message (it showed only "Request failed (400)").
+  const fail = (error) => res.status(400).json({ ok: false, error, message: error });
+  if (!cfg.tgBotToken || !cfg.tgChatId) return fail("Enter the bot token and the channel, then try again.");
+  const v = await verifyTelegram(cfg);
+  if (!v.ok) return fail(v.error);
+  if (b.verifyOnly) return res.json(v);
+  const text = String(b.message || "").trim() || `✅ Test post from ${site.siteName || "Post Me"} — Telegram auto-posting is connected.`;
+  const r = await sendTelegramMessage({ text }, cfg);
+  return r.ok ? res.json({ ...v, ...r }) : fail(r.error);
+}
+
+// POST /api/settings/telegram/find-chats { tgBotToken? } → { chats:[{ id, title, type }] }
+// The channels / groups the bot was added to — pick one to fill in its id.
+export async function findTelegramChatsRoute(req, res) {
+  const site = await getOrCreate();
+  const token = String(req.body?.tgBotToken || "").trim() || site.tgBotToken;
+  if (!token) return res.status(400).json({ message: "Enter the bot token first." });
+  const r = await findTelegramChats(token);
+  if (!r.ok) return res.status(400).json({ message: r.error });
+  res.json({ chats: r.chats });
+}
+
+// POST /api/settings/instagram/test — admin: verify the linked IG account and
+// (unless verifyOnly) publish a test image post to Instagram.
+export async function testInstagramPost(req, res) {
+  const cfg = await getFacebookConfig();
+  if (!cfg.pageId || !cfg.token) {
+    return res.status(400).json({ ok: false, error: "Connect Facebook first (Page ID + token)." });
+  }
+  const igId = await getInstagramUserId(cfg);
+  if (!igId) {
+    return res.status(400).json({ ok: false, error: "No Instagram Business/Creator account is linked to this Facebook Page. Link it in your Facebook Page settings, then try again." });
+  }
+  if (req.body?.verifyOnly) return res.json({ ok: true, igUserId: igId });
+
+  const site = await getOrCreate();
+  const title = `Test post from ${site.siteName || "Post Me"}`;
+  const rendered = await renderQuestionImage(
+    { text: title, options: ["Ready", "Set", "Go", "Posted!"], correct: 3 },
+    { includeOptions: true }
+  );
+  if (!rendered.url) return res.status(502).json({ ok: false, error: rendered.error || "Could not generate the image." });
+  // Pad to Instagram's 4:5 canvas so the aspect ratio is always accepted.
+  const result = await postToInstagram({ imageUrl: toInstagramSafeUrl(rendered.url), caption: `${title} — Instagram auto-posting is connected. ✅` }, cfg);
+  return res.status(result.ok ? 200 : 502).json(result);
+}
+
+// POST /api/settings/selfie-watermark — admin: upload a selfie image to be used
+// as a watermark on Facebook/Instagram image posts. Accepts multipart (file) or
+// a base64 data URI in the body. Stores the Cloudinary URL in Settings.
+export async function uploadSelfieWatermark(req, res) {
+  try {
+    let fileStr = null;
+
+    // If multer attached a file (multipart upload), convert it to a base64 data URI.
+    if (req.file) {
+      const mime = req.file.mimetype || "image/png";
+      fileStr = `data:${mime};base64,${req.file.buffer.toString("base64")}`;
+    } else if (req.body?.image) {
+      // Base64 data URI sent directly in the body (from frontend FileReader).
+      fileStr = String(req.body.image);
+    }
+
+    if (!fileStr) {
+      return res.status(400).json({ ok: false, error: "No image provided. Upload a file or send a base64 image." });
+    }
+
+    const { url } = await uploadToCloudinary(fileStr, "postme/watermarks");
+    if (!url) return res.status(502).json({ ok: false, error: "Cloudinary upload failed." });
+
+    // Save the URL to THIS site's settings doc.
+    const site = await getOrCreate();
+    const s = await Settings.findByIdAndUpdate(site._id, { fbSelfieWatermarkUrl: url }, { new: true });
+    res.json({ ok: true, url, settings: safeSettings(s) });
+  } catch (err) {
+    res.status(500).json({ ok: false, error: err.message || "Upload failed." });
+  }
+}
+
+// DELETE /api/settings/selfie-watermark — admin: remove the selfie watermark.
+export async function deleteSelfieWatermark(req, res) {
+  const site = await getOrCreate();
+  const s = await Settings.findByIdAndUpdate(site._id, { fbSelfieWatermarkUrl: "" }, { new: true });
+  res.json({ ok: true, settings: safeSettings(s) });
+}
