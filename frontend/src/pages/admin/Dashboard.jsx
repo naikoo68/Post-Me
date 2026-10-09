@@ -55,7 +55,7 @@ export default function Dashboard() {
         <MonitorPlay className="h-8 w-8 text-brand-600" />
         <div>
           <p className="text-3xl font-extrabold">{stats?.lifetime ?? 0}</p>
-          <p className="text-sm text-slate-500">posts published so far{stats?.recent?.length ? ` · last: ${new Date(stats.recent[0].createdAt || stats.recent[0].postedAt || Date.now()).toLocaleString()}` : ""}</p>
+          <p className="text-sm text-slate-500">posts published so far{stats?.recent?.[0]?.postedAt ? ` · last: ${new Date(stats.recent[0].postedAt).toLocaleString()}` : ""}</p>
         </div>
       </div>
 
